@@ -1,0 +1,30 @@
+name: treeco
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - pillow
+  - matplotlib
+  - scikit-learn
+  - tqdm
+  - folium
+  - rasterio
+  - pyproj
+  - geopandas
+  - shapely
+  - ipykernel
+  - jupyterlab
+
+  - pip:
+      - torch
+      - torchvision
+      - transformers
+      - sentence-transformers
+      - timm
+      - open-clip-torch
+      - segment-anything
