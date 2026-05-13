@@ -29,6 +29,9 @@ treeco-build-manifest = "treeco.data.build_manifest:main"
 treeco-estimate-carbon = "treeco.carbon.estimate_carbon:main"
 treeco-predict = "treeco.inference.predict:main"
 
+treeco-download-models = "treeco.image_models.download_cli:main"
+treeco-build-dataset = "treeco.pipeline.build_dataset_cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["treeco*"]

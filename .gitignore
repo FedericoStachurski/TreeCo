@@ -1,21 +1,53 @@
+# =========================
+# Python
+# =========================
 __pycache__/
 *.py[cod]
-.ipynb_checkpoints/
 
+# Virtual environments
 .env
 .venv/
 venv/
-*.egg-info/
 
+# Packaging
+*.egg-info/
+build/
+dist/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# =========================
+# Project data
+# =========================
 data/raw/
 data/processed/
-models/checkpoints/
 outputs/
+checkpoints/
+notebooks/*.ipynb
+IMAGE_MODELS/
+models/
 
+
+# Large ML artifacts
 *.npy
+*.npz
 *.pt
 *.pth
 *.ckpt
+*.onnx
+
+# Raster / imagery
 *.tif
 *.tiff
+
+# Archives
 *.zip
+*.tar
+*.gz
+*.xlsx
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/settings.json
