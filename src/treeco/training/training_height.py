@@ -7,6 +7,7 @@ import random
 from datetime import datetime
 from pathlib import Path
 
+
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -15,6 +16,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
+import torchvision.transforms.functional as TF
 
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
@@ -64,53 +66,24 @@ class TreeHeightDataset(Dataset):
         else:
             raise ValueError(f"Unknown image_source: {image_source}")
 
-        if train:
-            self.rgb_tfms = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(8),
-                transforms.ColorJitter(
-                    brightness=0.15,
-                    contrast=0.15,
-                    saturation=0.10,
-                    hue=0.02,
-                ),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ])
+        self.color_jitter = transforms.ColorJitter(
+            brightness=0.15,
+            contrast=0.15,
+            saturation=0.10,
+            hue=0.02,
+        )
 
-            self.rgb_erasing = transforms.RandomErasing(
-                p=0.20,
-                scale=(0.02, 0.10),
-                ratio=(0.3, 3.3),
-                value="random",
-            )
-        else:
-            self.rgb_tfms = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ])
-            self.rgb_erasing = None
-
-        self.single_resize = transforms.Resize((image_size, image_size))
-        self.single_to_tensor = transforms.ToTensor()
+        self.rgb_erasing = transforms.RandomErasing(
+            p=0.20,
+            scale=(0.02, 0.10),
+            ratio=(0.3, 3.3),
+            value="random",
+        )
 
     def __len__(self) -> int:
         return len(self.df)
 
-    def _load_single_channel_npy(
-        self,
-        path: str,
-        dtype: torch.dtype,
-        fallback_value: float = 0.0,
-    ) -> torch.Tensor:
+    def _load_single_channel_image(self, path: str) -> Image.Image:
         try:
             arr = np.load(path).astype(np.float32)
 
@@ -127,43 +100,110 @@ class TreeHeightDataset(Dataset):
             arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
 
             img = Image.fromarray((arr * 255).astype(np.uint8)).convert("L")
-            img = self.single_resize(img)
-
-            tensor = self.single_to_tensor(img).to(dtype=dtype)
 
         except Exception:
-            tensor = torch.full(
-                (1, self.image_size, self.image_size),
-                fallback_value,
-                dtype=dtype,
+            img = Image.fromarray(
+                np.zeros((self.image_size, self.image_size), dtype=np.uint8)
+            ).convert("L")
+
+        return img
+
+    def _apply_shared_geometric_transforms(
+        self,
+        rgb: Image.Image,
+        single_channels: list[Image.Image],
+    ):
+        # Resize all modalities first
+        rgb = TF.resize(rgb, [self.image_size, self.image_size])
+        single_channels = [
+            TF.resize(ch, [self.image_size, self.image_size])
+            for ch in single_channels
+        ]
+
+        if self.train:
+            # Same horizontal flip for RGB, SAM, depth
+            if random.random() < 0.5:
+                rgb = TF.hflip(rgb)
+                single_channels = [TF.hflip(ch) for ch in single_channels]
+
+            # Same rotation angle for RGB, SAM, depth
+            angle = random.uniform(-8, 8)
+            rgb = TF.rotate(
+                rgb,
+                angle,
+                interpolation=TF.InterpolationMode.BILINEAR,
+                fill=0,
             )
 
+            single_channels = [
+                TF.rotate(
+                    ch,
+                    angle,
+                    interpolation=TF.InterpolationMode.BILINEAR,
+                    fill=0,
+                )
+                for ch in single_channels
+            ]
+
+        return rgb, single_channels
+
+    def _rgb_to_tensor(self, rgb: Image.Image) -> torch.Tensor:
+        if self.train:
+            rgb = self.color_jitter(rgb)
+
+        rgb_tensor = TF.to_tensor(rgb)
+        rgb_tensor = TF.normalize(
+            rgb_tensor,
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+
+        if self.train:
+            rgb_tensor = self.rgb_erasing(rgb_tensor)
+
+        return rgb_tensor
+
+    def _single_to_tensor(
+        self,
+        img: Image.Image,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        tensor = TF.to_tensor(img).to(dtype=dtype)
         return tensor
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
 
         rgb = Image.open(row[self.rgb_col]).convert("RGB")
-        rgb_tensor = self.rgb_tfms(rgb)
 
-        if self.train and self.rgb_erasing is not None:
-            rgb_tensor = self.rgb_erasing(rgb_tensor)
+        single_channels = []
+
+        if self.use_sam:
+            single_channels.append(
+                self._load_single_channel_image(row["SAM_LOGITS_PATH"])
+            )
+
+        if self.use_depth:
+            single_channels.append(
+                self._load_single_channel_image(row["DEPTH_PATH"])
+            )
+
+        rgb, single_channels = self._apply_shared_geometric_transforms(
+            rgb,
+            single_channels,
+        )
+
+        rgb_tensor = self._rgb_to_tensor(rgb)
 
         channels = [rgb_tensor]
 
-        if self.use_sam:
-            sam_tensor = self._load_single_channel_npy(
-                row["SAM_LOGITS_PATH"],
-                dtype=rgb_tensor.dtype,
+        for ch in single_channels:
+            channels.append(
+                self._single_to_tensor(
+                    ch,
+                    dtype=rgb_tensor.dtype,
+                )
             )
-            channels.append(sam_tensor)
-
-        if self.use_depth:
-            depth_tensor = self._load_single_channel_npy(
-                row["DEPTH_PATH"],
-                dtype=rgb_tensor.dtype,
-            )
-            channels.append(depth_tensor)
 
         x = torch.cat(channels, dim=0)
         y = int(row["HEIGHT_CLASS_IDX"])
