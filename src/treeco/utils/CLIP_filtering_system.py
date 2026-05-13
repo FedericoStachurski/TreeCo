@@ -15,11 +15,7 @@ ImageLike = Union[str, Path, Image.Image]
 
 
 DEFAULT_TREE_PROMPTS = [
-    "tree",
-    "tree trunk",
-    "tree canopy",
-    "branches and leaves",
-    "urban street tree",
+    "tree"
 ]
 
 DEFAULT_NEGATIVE_PROMPTS = [

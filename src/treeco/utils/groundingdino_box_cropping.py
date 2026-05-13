@@ -17,12 +17,7 @@ Box = List[int]
 
 
 DEFAULT_TREE_LABELS = [[
-    "tree",
-    "tree trunk",
-    "tree canopy",
-    "tree crown",
-    "street tree",
-    "urban tree",
+    "tree"
 ]]
 
 

@@ -20,6 +20,7 @@ dist/
 # =========================
 # Project data
 # =========================
+data/
 data/raw/
 data/processed/
 outputs/

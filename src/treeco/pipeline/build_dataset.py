@@ -68,6 +68,8 @@ def explode_media(df: pd.DataFrame) -> pd.DataFrame:
     keep_cols = [
         "ID",
         "TREE",
+        "TREE_TYPE",
+        "OTHER_TREE",
         "TREE_HEIGHT_METHOD",
         "TREE_HEIGHT_IN_METERS",
         "ESTIMATED_TREE_HEIGHT",
@@ -98,7 +100,44 @@ def explode_media(df: pd.DataFrame) -> pd.DataFrame:
 
             rows.append(out)
 
-    return pd.DataFrame(rows)
+    out_df = pd.DataFrame(rows)
+
+    if not out_df.empty:
+        tree_type = (
+            out_df.get("TREE_TYPE", "")
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        if "OTHER_TREE" in out_df.columns:
+            other_tree = (
+                out_df["OTHER_TREE"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+            )
+        else:
+            other_tree = pd.Series("", index=out_df.index)
+
+        out_df["TREE_TYPE_RAW"] = tree_type
+        out_df["OTHER_TREE_RAW"] = other_tree
+
+        out_df["TREE_SPECIES_LABEL"] = np.where(
+            tree_type.str.lower().eq("other") & other_tree.ne(""),
+            other_tree,
+            tree_type,
+        )
+
+        out_df["TREE_SPECIES_LABEL"] = (
+            out_df["TREE_SPECIES_LABEL"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .replace("", "Unknown")
+        )
+
+    return out_df
 
 
 def add_height_labels(df: pd.DataFrame) -> pd.DataFrame:
@@ -555,6 +594,11 @@ def build_tree_dataset(
         "DINO_LABEL",
         "DINO_AREA_RATIO",
         "DINO_USED_FULL_IMAGE_FALLBACK",
+        "TREE_TYPE",
+        "OTHER_TREE",
+        "TREE_TYPE_RAW",
+        "OTHER_TREE_RAW",
+        "TREE_SPECIES_LABEL",
         "HEIGHT_VALUE_M",
         "HEIGHT_CLASS_STR",
         "HEIGHT_CLASS_IDX",
