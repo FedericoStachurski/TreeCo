@@ -31,7 +31,8 @@ treeco-predict = "treeco.inference.predict:main"
 
 treeco-download-models = "treeco.image_models.download_cli:main"
 treeco-build-dataset = "treeco.pipeline.build_dataset_cli:main"
-
+treeco-train-height = "treeco.training.training_height_cli:main"
+treeco-plot-training = "treeco.training.plot_training_run_cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["treeco*"]
