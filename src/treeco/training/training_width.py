@@ -7,7 +7,6 @@ import random
 from datetime import datetime
 from pathlib import Path
 
-
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -19,8 +18,7 @@ from torchvision import models, transforms
 import torchvision.transforms.functional as TF
 
 from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import f1_score, recall_score, accuracy_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 def seed_everything(seed: int) -> None:
@@ -38,7 +36,7 @@ INPUT_CHANNELS = {
 }
 
 
-class TreeHeightDataset(Dataset):
+class TreeDBHDataset(Dataset):
     def __init__(
         self,
         df: pd.DataFrame,
@@ -113,7 +111,6 @@ class TreeHeightDataset(Dataset):
         rgb: Image.Image,
         single_channels: list[Image.Image],
     ):
-        # Resize all modalities first
         rgb = TF.resize(rgb, [self.image_size, self.image_size])
         single_channels = [
             TF.resize(ch, [self.image_size, self.image_size])
@@ -121,13 +118,12 @@ class TreeHeightDataset(Dataset):
         ]
 
         if self.train:
-            # Same horizontal flip for RGB, SAM, depth
             if random.random() < 0.5:
                 rgb = TF.hflip(rgb)
                 single_channels = [TF.hflip(ch) for ch in single_channels]
 
-            # Same rotation angle for RGB, SAM, depth
             angle = random.uniform(-8, 8)
+
             rgb = TF.rotate(
                 rgb,
                 angle,
@@ -163,13 +159,8 @@ class TreeHeightDataset(Dataset):
 
         return rgb_tensor
 
-    def _single_to_tensor(
-        self,
-        img: Image.Image,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        tensor = TF.to_tensor(img).to(dtype=dtype)
-        return tensor
+    def _single_to_tensor(self, img: Image.Image, dtype: torch.dtype) -> torch.Tensor:
+        return TF.to_tensor(img).to(dtype=dtype)
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
@@ -194,26 +185,21 @@ class TreeHeightDataset(Dataset):
         )
 
         rgb_tensor = self._rgb_to_tensor(rgb)
-
         channels = [rgb_tensor]
 
         for ch in single_channels:
-            channels.append(
-                self._single_to_tensor(
-                    ch,
-                    dtype=rgb_tensor.dtype,
-                )
-            )
+            channels.append(self._single_to_tensor(ch, dtype=rgb_tensor.dtype))
 
         x = torch.cat(channels, dim=0)
-        y = int(row["HEIGHT_CLASS_IDX"])
+
+        # Continuous regression target: diameter / DBH in cm
+        y = torch.tensor(float(row["DBH_CM"]), dtype=torch.float32)
 
         return x, y
 
 
 def build_resnet(
     backbone: str,
-    num_classes: int,
     in_channels: int,
     device: torch.device,
     dropout_rate: float = 0.1,
@@ -255,7 +241,7 @@ def build_resnet(
 
     model.fc = nn.Sequential(
         nn.Dropout(p=dropout_rate),
-        nn.Linear(model.fc.in_features, num_classes),
+        nn.Linear(model.fc.in_features, 1),
     )
 
     return model.to(device)
@@ -273,7 +259,7 @@ def run_epoch(
 
     total_loss = 0.0
     all_preds = []
-    all_labels = []
+    all_targets = []
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -283,26 +269,31 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train_mode):
-            logits = model(x)
-            loss = criterion(logits, y)
+            preds = model(x).squeeze(1)
+            loss = criterion(preds, y)
 
             if train_mode:
                 loss.backward()
                 optimizer.step()
 
-        preds = logits.argmax(dim=1)
-
         total_loss += loss.item() * x.size(0)
         all_preds.extend(preds.detach().cpu().numpy())
-        all_labels.extend(y.detach().cpu().numpy())
+        all_targets.extend(y.detach().cpu().numpy())
 
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
+    all_preds = np.array(all_preds, dtype=np.float32)
+    all_targets = np.array(all_targets, dtype=np.float32)
 
-    avg_loss = total_loss / max(len(all_labels), 1)
-    acc = accuracy_score(all_labels, all_preds)
+    avg_loss = total_loss / max(len(all_targets), 1)
 
-    return avg_loss, acc, all_preds, all_labels
+    mae = mean_absolute_error(all_targets, all_preds)
+    rmse = mean_squared_error(all_targets, all_preds) ** 0.5
+
+    try:
+        r2 = r2_score(all_targets, all_preds)
+    except Exception:
+        r2 = np.nan
+
+    return avg_loss, mae, rmse, r2, all_preds, all_targets
 
 
 def find_dataset_dir(
@@ -338,9 +329,9 @@ def load_manifest(dataset_dir: Path) -> pd.DataFrame:
     df = pd.read_csv(manifest_path)
 
     required = [
+        "ID",
         "RGB_CROP_PATH",
-        "HEIGHT_CLASS_STR",
-        "HEIGHT_CLASS_IDX",
+        "DBH_CM",
     ]
 
     missing = [c for c in required if c not in df.columns]
@@ -358,36 +349,21 @@ def load_manifest(dataset_dir: Path) -> pd.DataFrame:
             df[col] = np.nan
 
     if "TRAINABLE" in df.columns:
-        df = df[df["TRAINABLE"].astype(str).str.lower().isin(["true", "1", "yes"])].copy()
+        df = df[
+            df["TRAINABLE"]
+            .astype(str)
+            .str.lower()
+            .isin(["true", "1", "yes"])
+        ].copy()
 
-    df = df[
-        df["HEIGHT_CLASS_STR"].notna()
-        & df["HEIGHT_CLASS_IDX"].notna()
-    ].copy()
+    df["DBH_CM"] = pd.to_numeric(df["DBH_CM"], errors="coerce")
+    df = df[df["DBH_CM"].notna()].copy()
 
-    df["HEIGHT_CLASS_IDX_ORIGINAL"] = df["HEIGHT_CLASS_IDX"].astype(int)
-
-    class_order = (
-        df[["HEIGHT_CLASS_IDX_ORIGINAL", "HEIGHT_CLASS_STR"]]
-        .drop_duplicates()
-        .sort_values("HEIGHT_CLASS_IDX_ORIGINAL")
-    )
-
-    remap = {
-        old_idx: new_idx
-        for new_idx, old_idx in enumerate(class_order["HEIGHT_CLASS_IDX_ORIGINAL"])
-    }
-
-    df["HEIGHT_CLASS_IDX"] = df["HEIGHT_CLASS_IDX_ORIGINAL"].map(remap).astype(int)
-
-    print("\nHeight class remapping:")
-    for _, row in class_order.iterrows():
-        old_idx = int(row["HEIGHT_CLASS_IDX_ORIGINAL"])
-        new_idx = remap[old_idx]
-        label = row["HEIGHT_CLASS_STR"]
-        print(f"  original {old_idx} -> train {new_idx}: {label}")
+    # Optional sanity filter: removes zero/negative weird labels
+    df = df[df["DBH_CM"] > 0].copy()
 
     return df.reset_index(drop=True)
+
 
 def filter_manifest_for_inputs(
     df: pd.DataFrame,
@@ -403,40 +379,43 @@ def filter_manifest_for_inputs(
     else:
         raise ValueError(f"Unknown image_source: {image_source}")
 
-    # RGB existence
     df = df[df[rgb_col].notna()].copy()
     df = df[df[rgb_col].apply(lambda p: Path(str(p)).exists())].copy()
 
-    # Depth requirements
     if input_mode in {"rgb_depth", "rgb_sam_depth"}:
         df = df[df["DEPTH_PATH"].notna()].copy()
-        df = df[
-            df["DEPTH_PATH"].apply(lambda p: Path(str(p)).exists())
-        ].copy()
+        df = df[df["DEPTH_PATH"].apply(lambda p: Path(str(p)).exists())].copy()
 
-    # SAM requirements
     if input_mode in {"rgb_sam", "rgb_sam_depth"}:
         df = df[df["SAM_LOGITS_PATH"].notna()].copy()
-        df = df[
-            df["SAM_LOGITS_PATH"].apply(lambda p: Path(str(p)).exists())
-        ].copy()
+        df = df[df["SAM_LOGITS_PATH"].apply(lambda p: Path(str(p)).exists())].copy()
 
     df = df.drop_duplicates(subset=[rgb_col]).reset_index(drop=True)
 
     return df
 
 
-def make_class_mapping(df: pd.DataFrame) -> dict[str, str]:
-    mapping_df = (
-        df[["HEIGHT_CLASS_IDX", "HEIGHT_CLASS_STR"]]
-        .drop_duplicates()
-        .sort_values("HEIGHT_CLASS_IDX")
-    )
+def make_regression_stratification_bins(tree_df: pd.DataFrame) -> pd.Series | None:
+    """
+    Creates temporary DBH bins for tree-level stratified splitting.
+    Falls back to None if there are too few examples per bin.
+    """
+    try:
+        bins = pd.qcut(
+            tree_df["DBH_CM"],
+            q=min(5, tree_df["DBH_CM"].nunique()),
+            duplicates="drop",
+        )
 
-    return {
-        str(int(row["HEIGHT_CLASS_IDX"])): str(row["HEIGHT_CLASS_STR"])
-        for _, row in mapping_df.iterrows()
-    }
+        counts = bins.value_counts()
+
+        if len(counts) < 2 or counts.min() < 2:
+            return None
+
+        return bins.astype(str)
+
+    except Exception:
+        return None
 
 
 def main():
@@ -470,7 +449,6 @@ def main():
         type=str,
         default="rgb",
         choices=["rgb", "rgb_depth", "rgb_sam", "rgb_sam_depth"],
-        help="Model inputs: RGB only, RGB+Depth, RGB+SAM, or RGB+SAM+Depth.",
     )
 
     ap.add_argument(
@@ -478,7 +456,6 @@ def main():
         type=str,
         default="crop",
         choices=["crop", "full"],
-        help="Use DINO-cropped RGB image or full original RGB image.",
     )
 
     ap.add_argument("--image_size", type=int, default=224)
@@ -522,64 +499,47 @@ def main():
     print(f"Device: {device}")
     print(f"Input mode: {args.input_mode}")
     print(f"Image source: {args.image_source}")
-    print(f"Total rows: {len(df)}")
-    print("\nFull class counts:")
-    print(df["HEIGHT_CLASS_STR"].value_counts().sort_index())
+    print(f"Total labelled image rows: {len(df)}")
+    print(f"Unique trees: {df['ID'].nunique()}")
 
-# ---------------------------------------------------
-# Tree-level split (prevents leakage across images)
-# ---------------------------------------------------
+    print("\nDBH_CM summary:")
+    print(df["DBH_CM"].describe())
+
+    # ---------------------------------------------------
+    # Tree-level split to prevent leakage across images
+    # ---------------------------------------------------
 
     tree_df = (
-        df[["ID", "HEIGHT_CLASS_IDX"]]
-        .drop_duplicates()
+        df.groupby("ID", as_index=False)
+        .agg(DBH_CM=("DBH_CM", "mean"))
         .reset_index(drop=True)
     )
+
+    stratify_bins = make_regression_stratification_bins(tree_df)
 
     train_tree_ids, val_tree_ids = train_test_split(
         tree_df["ID"],
         test_size=args.val_size,
         random_state=args.random_state,
-        stratify=tree_df["HEIGHT_CLASS_IDX"],
+        stratify=stratify_bins,
     )
 
-    train_df = df[df["ID"].isin(train_tree_ids)].copy()
-    val_df = df[df["ID"].isin(val_tree_ids)].copy()
+    train_df = df[df["ID"].isin(train_tree_ids)].copy().reset_index(drop=True)
+    val_df = df[df["ID"].isin(val_tree_ids)].copy().reset_index(drop=True)
 
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
-
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
-
-    print("\nUnique trees:")
+    print("\nSplit:")
     print(f"Train trees: {train_df['ID'].nunique()}")
-    print("\nTrain class counts:")
-    print(train_df["HEIGHT_CLASS_STR"].value_counts().sort_index())
-    
-    print("\nValidation class counts:")
-    print(val_df["HEIGHT_CLASS_STR"].value_counts().sort_index())
     print(f"Val trees: {val_df['ID'].nunique()}")
-
-    print("\nImages:")
     print(f"Train images: {len(train_df)}")
     print(f"Val images: {len(val_df)}")
 
-    classes = np.sort(train_df["HEIGHT_CLASS_IDX"].unique())
+    print("\nTrain DBH summary:")
+    print(train_df["DBH_CM"].describe())
 
-    class_weights_np = compute_class_weight(
-        class_weight="balanced",
-        classes=classes,
-        y=train_df["HEIGHT_CLASS_IDX"],
-    )
+    print("\nValidation DBH summary:")
+    print(val_df["DBH_CM"].describe())
 
-    class_weights = torch.tensor(
-        class_weights_np,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    train_ds = TreeHeightDataset(
+    train_ds = TreeDBHDataset(
         train_df,
         image_size=args.image_size,
         input_mode=args.input_mode,
@@ -587,7 +547,7 @@ def main():
         train=True,
     )
 
-    val_ds = TreeHeightDataset(
+    val_ds = TreeDBHDataset(
         val_df,
         image_size=args.image_size,
         input_mode=args.input_mode,
@@ -612,20 +572,15 @@ def main():
     )
 
     in_channels = INPUT_CHANNELS[args.input_mode]
-    num_classes = int(df["HEIGHT_CLASS_IDX"].nunique())
 
     model = build_resnet(
         backbone=args.backbone,
-        num_classes=num_classes,
         in_channels=in_channels,
         device=device,
         dropout_rate=args.dropout_rate,
     )
 
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights,
-        label_smoothing=0.1,
-    )
+    criterion = nn.SmoothL1Loss()
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -635,12 +590,12 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="max",
+        mode="min",
         factor=0.5,
         patience=4,
     )
 
-    models_root = out_root / "tree_height_models"
+    models_root = out_root / "tree_dbh_models"
     models_root.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -649,7 +604,7 @@ def main():
         run_name = f"{args.run_name}_{timestamp}"
     else:
         run_name = (
-            f"height_{args.backbone}_"
+            f"dbh_{args.backbone}_"
             f"{args.input_mode}_{args.image_source}_{timestamp}"
         )
 
@@ -662,13 +617,11 @@ def main():
     history_path = run_dir / "history.json"
     metrics_path = run_dir / "metrics.json"
 
-    class_mapping = make_class_mapping(df)
-
     config = {
-        "task": "height_classification",
+        "task": "dbh_regression",
+        "target": "DBH_CM",
         "dataset_dir": str(dataset_dir),
         "backbone": args.backbone,
-        "num_classes": num_classes,
         "in_channels": in_channels,
         "input_mode": args.input_mode,
         "image_source": args.image_source,
@@ -683,9 +636,8 @@ def main():
         "val_size": args.val_size,
         "random_state": args.random_state,
         "num_workers": args.num_workers,
-        "class_weighted_loss": True,
+        "loss": "SmoothL1Loss",
         "device": str(device),
-        "height_class_mapping": class_mapping,
     }
 
     with open(config_path, "w") as f:
@@ -694,20 +646,22 @@ def main():
     history = {
         "train_loss": [],
         "val_loss": [],
-        "train_acc": [],
-        "val_acc": [],
-        "val_f1_macro": [],
-        "val_recall_macro": [],
+        "train_mae": [],
+        "val_mae": [],
+        "train_rmse": [],
+        "val_rmse": [],
+        "train_r2": [],
+        "val_r2": [],
         "lr": [],
     }
 
-    best_val_f1 = -1.0
+    best_val_mae = float("inf")
     best_epoch = -1
 
     print(f"\nSaving training run to: {run_dir}")
 
     for epoch in range(args.epochs):
-        train_loss, train_acc, _, _ = run_epoch(
+        train_loss, train_mae, train_rmse, train_r2, _, _ = run_epoch(
             model=model,
             loader=train_loader,
             criterion=criterion,
@@ -715,7 +669,7 @@ def main():
             optimizer=optimizer,
         )
 
-        val_loss, val_acc, val_preds, val_labels = run_epoch(
+        val_loss, val_mae, val_rmse, val_r2, val_preds, val_targets = run_epoch(
             model=model,
             loader=val_loader,
             criterion=criterion,
@@ -723,37 +677,26 @@ def main():
             optimizer=None,
         )
 
-        val_f1_macro = f1_score(
-            val_labels,
-            val_preds,
-            average="macro",
-            zero_division=0,
-        )
-
-        val_recall_macro = recall_score(
-            val_labels,
-            val_preds,
-            average="macro",
-            zero_division=0,
-        )
-
-        scheduler.step(val_f1_macro)
+        scheduler.step(val_mae)
 
         current_lr = optimizer.param_groups[0]["lr"]
 
         history["train_loss"].append(float(train_loss))
         history["val_loss"].append(float(val_loss))
-        history["train_acc"].append(float(train_acc))
-        history["val_acc"].append(float(val_acc))
-        history["val_f1_macro"].append(float(val_f1_macro))
-        history["val_recall_macro"].append(float(val_recall_macro))
+        history["train_mae"].append(float(train_mae))
+        history["val_mae"].append(float(val_mae))
+        history["train_rmse"].append(float(train_rmse))
+        history["val_rmse"].append(float(val_rmse))
+        history["train_r2"].append(float(train_r2))
+        history["val_r2"].append(float(val_r2))
         history["lr"].append(float(current_lr))
 
         print(
             f"Epoch {epoch + 1:03d}/{args.epochs} | "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} | "
-            f"val_f1={val_f1_macro:.4f} val_recall={val_recall_macro:.4f} | "
+            f"train_loss={train_loss:.4f} train_MAE={train_mae:.2f}cm "
+            f"train_RMSE={train_rmse:.2f}cm | "
+            f"val_loss={val_loss:.4f} val_MAE={val_mae:.2f}cm "
+            f"val_RMSE={val_rmse:.2f}cm val_R2={val_r2:.4f} | "
             f"lr={current_lr:.2e}"
         )
 
@@ -761,21 +704,21 @@ def main():
             "model_state_dict": model.state_dict(),
             "epoch": epoch + 1,
             "backbone": args.backbone,
-            "num_classes": num_classes,
             "in_channels": in_channels,
             "input_mode": args.input_mode,
             "image_source": args.image_source,
             "image_size": args.image_size,
-            "height_class_mapping": class_mapping,
-            "val_accuracy": float(val_acc),
-            "val_f1_macro": float(val_f1_macro),
-            "val_recall_macro": float(val_recall_macro),
+            "target": "DBH_CM",
+            "val_loss": float(val_loss),
+            "val_mae": float(val_mae),
+            "val_rmse": float(val_rmse),
+            "val_r2": float(val_r2),
         }
 
         torch.save(checkpoint, last_model_path)
 
-        if val_f1_macro > best_val_f1:
-            best_val_f1 = val_f1_macro
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
             best_epoch = epoch + 1
             torch.save(checkpoint, best_model_path)
 
@@ -784,25 +727,36 @@ def main():
 
     metrics = {
         "best_epoch": int(best_epoch),
-        "best_val_f1_macro": float(best_val_f1),
-        "final_val_accuracy": float(history["val_acc"][-1]),
-        "final_val_f1_macro": float(history["val_f1_macro"][-1]),
-        "final_val_recall_macro": float(history["val_recall_macro"][-1]),
-        "n_train": int(len(train_df)),
-        "n_val": int(len(val_df)),
+        "best_val_mae_cm": float(best_val_mae),
+        "final_val_loss": float(history["val_loss"][-1]),
+        "final_val_mae_cm": float(history["val_mae"][-1]),
+        "final_val_rmse_cm": float(history["val_rmse"][-1]),
+        "final_val_r2": float(history["val_r2"][-1]),
+        "n_train_images": int(len(train_df)),
+        "n_val_images": int(len(val_df)),
+        "n_train_trees": int(train_df["ID"].nunique()),
+        "n_val_trees": int(val_df["ID"].nunique()),
     }
 
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=4)
 
-    np.save(run_dir / "val_labels.npy", val_labels)
+    np.save(run_dir / "val_targets_dbh_cm.npy", val_targets)
+    np.save(run_dir / "val_preds_dbh_cm.npy", val_preds)
+    np.save(run_dir / "val_labels.npy", val_targets)
     np.save(run_dir / "val_preds.npy", val_preds)
+
+    pred_df = val_df[["ID", "IMAGE_ID", "DBH_CM"]].copy()
+    pred_df["PRED_DBH_CM"] = val_preds
+    pred_df["ABS_ERROR_CM"] = (pred_df["PRED_DBH_CM"] - pred_df["DBH_CM"]).abs()
+    pred_df.to_csv(run_dir / "val_predictions.csv", index=False)
 
     print("\nTraining complete.")
     print(f"Best epoch: {best_epoch}")
-    print(f"Best val macro F1: {best_val_f1:.4f}")
+    print(f"Best val MAE: {best_val_mae:.2f} cm")
     print(f"Saved best model to: {best_model_path}")
     print(f"Saved last model to: {last_model_path}")
+    print(f"Saved validation predictions to: {run_dir / 'val_predictions.csv'}")
 
 
 if __name__ == "__main__":
