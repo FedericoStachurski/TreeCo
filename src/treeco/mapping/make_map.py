@@ -4,13 +4,14 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
+import ast
 
 import branca.colormap as cm
 from branca.element import Element
 import folium
 import numpy as np
 import pandas as pd
-
+from html import escape
 
 # =========================================================
 # Assumptions
@@ -351,46 +352,63 @@ def build_carbon_table(
     return agg
 
 
-# =========================================================
-# Map
-# =========================================================
-
 def make_image_scroller(image_urls, color):
-    if not isinstance(image_urls, list) or len(image_urls) == 0:
+    import re
+
+    if image_urls is None:
         return ""
 
-    valid_urls = [
-        u for u in image_urls
-        if isinstance(u, str) and u.startswith("http")
-    ]
+    if isinstance(image_urls, list):
+        urls = image_urls
+    else:
+        urls = re.findall(r'https?://[^\s,"\']+', str(image_urls))
 
-    if not valid_urls:
+    urls = [u.strip() for u in urls if str(u).startswith("http")]
+
+    if not urls:
         return ""
 
-    imgs = "\n".join([
-        f"""
-        <div style="display:inline-block; margin-right:8px;">
-            <img src="{url}" style="
-                height:220px;
-                max-width:300px;
-                border-radius:12px;
-                border:3px solid {color};
-                object-fit:cover;
-            ">
-        </div>
-        """
-        for url in valid_urls
+    first = urls[0]
+
+    extra_links = "".join([
+        f'''
+        <a href="{u}" target="_blank" style="
+            margin-right:8px;
+            color:{color};
+            font-weight:700;
+            text-decoration:none;
+        ">
+            Open image {i+2}
+        </a>
+        '''
+        for i, u in enumerate(urls[1:])
     ])
 
     return f"""
-    <div style="
-        margin-top:10px;
-        overflow-x:auto;
-        white-space:nowrap;
-        width:335px;
-        padding-bottom:8px;
-    ">
-        {imgs}
+    <div style="margin-top:10px; text-align:center;">
+
+        <a href="{first}" target="_blank">
+            <img src="{first}" style="
+                width:300px;
+                max-width:100%;
+                border-radius:12px;
+                border:3px solid {color};
+            ">
+        </a>
+
+        <div style="margin-top:10px;">
+            <a href="{first}" target="_blank" style="
+                color:{color};
+                font-weight:800;
+                text-decoration:none;
+                margin-right:10px;
+            ">
+                Open image 1
+            </a>
+
+            {extra_links}
+        </div>
+
     </div>
     """
 
@@ -410,7 +428,7 @@ def make_popup_html(row, colormap):
     return f"""
     <div style="width:375px; font-family:Arial, sans-serif;">
         <div style="font-size:24px; font-weight:900; color:{color}; text-align:center;">
-            {c_seq:.3f} ± {c_seq_unc:.3f} kg C / yr
+            {c_seq:.1f} ± {c_seq_unc:.1f} kg C / yr
         </div>
 
         <div style="font-size:14px; text-align:center; margin-bottom:10px;">
@@ -418,7 +436,7 @@ def make_popup_html(row, colormap):
         </div>
 
         <div style="font-size:15px; text-align:center; margin-bottom:10px;">
-            {co2_seq:.3f} ± {co2_seq_unc:.3f} kg CO₂e / yr
+            {co2_seq:.1f} ± {co2_seq_unc:.1f} kg CO₂e / yr
         </div>
 
         <div style="font-size:15px; text-align:center; margin-bottom:10px;">
@@ -435,7 +453,6 @@ def make_popup_html(row, colormap):
         {img_html}
     </div>
     """
-
 
 def marker_radius(value, vmin, vmax):
     if pd.isna(value):

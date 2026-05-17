@@ -38,6 +38,7 @@ treeco-infer-heights = "treeco.inference.infer_heights_cli:main"
 treeco-infer-widths = "treeco.inference.infer_widths_cli:main"
 treeco-combine-height-width = "treeco.utils.combine_height_width_cli:main"
 treeco-make-map = "treeco.mapping.make_map_cli:main"
+treeco-rawdata-make-map = "treeco.mapping.raw_data_make_map_cli:main" 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["treeco*"]
