@@ -2,8 +2,8 @@
 """
 Build a local TreeCo training dataset from a CommuniMap export.
 
-DINO is always used to find/crop the tree.
-RGB crops, SAM logits, and Depth Anything maps are saved only if requested.
+DINO is always used as a fallback crop source; SAM 3 can optionally replace the crop box with the largest tree candidate.
+RGB crops, SAM logits, SAM 3 masks/boxes, and Depth Anything maps are saved only if requested.
 
 Outputs:
 - manifests/tree_dataset_manifest.csv
@@ -36,7 +36,12 @@ from PIL import Image
 from tqdm import tqdm
 
 from treeco.image_models.download import get_model_path
-from treeco.image_models.sam import infer_sam_mask, load_sam
+from treeco.image_models.sam import (
+    infer_sam3_tree_candidates,
+    infer_sam_mask,
+    load_sam,
+    load_sam3,
+)
 from treeco.utils import CLIP_filtering_system
 from treeco.utils import depth_anything
 from treeco.utils import groundingdino_box_cropping
@@ -363,6 +368,72 @@ def expand_box_for_context(box, image_size, scale_x=1.25, scale_y=1.45):
     )
 
 
+def select_largest_sam3_candidate(result: dict, image_size) -> dict:
+    """
+    Select the largest SAM 3 candidate by tree area.
+
+    Priority:
+        1. Use mask pixel area if a mask exists.
+        2. Otherwise use bounding-box area.
+
+    Returns a normalized dictionary with:
+        box, score, mask, area_pixels, area_ratio, n_candidates
+    """
+    w, h = image_size
+    image_area = float(w * h)
+
+    candidates = result.get("candidates", []) if isinstance(result, dict) else []
+
+    if not candidates:
+        return {
+            "box": None,
+            "score": None,
+            "mask": None,
+            "area_pixels": None,
+            "area_ratio": None,
+            "n_candidates": 0,
+        }
+
+    best = None
+    best_area = -1.0
+
+    for cand in candidates:
+        mask = cand.get("mask")
+        box = cand.get("box")
+
+        if mask is not None:
+            area = float(np.asarray(mask).astype(bool).sum())
+        elif box is not None:
+            area = float(box_area(box))
+        else:
+            area = 0.0
+
+        if area > best_area:
+            best = cand
+            best_area = area
+
+    if best is None:
+        return {
+            "box": None,
+            "score": None,
+            "mask": None,
+            "area_pixels": None,
+            "area_ratio": None,
+            "n_candidates": len(candidates),
+        }
+
+    area_ratio = best_area / image_area if image_area > 0 else None
+
+    return {
+        "box": best.get("box"),
+        "score": best.get("score"),
+        "mask": best.get("mask"),
+        "area_pixels": best_area,
+        "area_ratio": area_ratio,
+        "n_candidates": len(candidates),
+    }
+
+
 # ---------------------------------------------------------------------
 # Manifest helpers
 # ---------------------------------------------------------------------
@@ -381,8 +452,16 @@ def get_manifest_columns(df_img: pd.DataFrame) -> list[str]:
         "RGB_CROP_PATH",
         "SAM_LOGITS_PATH",
         "SAM_SCORE",
+        "SAM3_MASK_PATH",
+        "SAM3_SCORE",
+        "SAM3_TREE_BOX",
+        "SAM3_AREA_PIXELS",
+        "SAM3_AREA_RATIO",
+        "SAM3_N_CANDIDATES",
         "DEPTH_PATH",
         "TREE_BOX",
+        "TREE_BOX_SOURCE",
+        "DINO_TREE_BOX",
         "DINO_SCORE",
         "ENTRY_MAX_DINO_SCORE",
         "DINO_LABEL",
@@ -490,6 +569,7 @@ def build_tree_dataset(
     dataset_name: str,
     keep_rgb: bool = True,
     keep_sam: bool = False,
+    keep_sam3: bool = False,
     keep_depth: bool = False,
     clip_model_path: str | Path | None = None,
     clip_threshold: float = 0.5,
@@ -499,6 +579,10 @@ def build_tree_dataset(
     dino_score_min: float = 0.25,
     depth_ckpt: str | Path | None = None,
     sam_ckpt: str | Path | None = None,
+    sam3_model_path: str | Path | None = None,
+    sam3_repo_path: str | Path | None = None,
+    sam3_prompt: str = "tree",
+    sam3_min_score: float | None = None,
 ) -> Path:
     input_path = Path(input_path)
     out_root = Path(out_root)
@@ -511,6 +595,10 @@ def build_tree_dataset(
         depth_ckpt = get_model_path("depth_anything")
     if keep_sam and sam_ckpt is None:
         sam_ckpt = get_model_path("sam")
+    if keep_sam3 and sam3_model_path is None:
+        sam3_model_path = get_model_path("sam3")
+    if keep_sam3 and sam3_repo_path is None:
+        sam3_repo_path = get_model_path("sam3_repo")
 
     assert_model_exists(clip_model_path, "CLIP")
     assert_model_exists(dino_model_path, "GroundingDINO")
@@ -518,6 +606,9 @@ def build_tree_dataset(
         assert_model_exists(depth_ckpt, "Depth Anything")
     if keep_sam:
         assert_model_exists(sam_ckpt, "SAM")
+    if keep_sam3:
+        assert_model_exists(sam3_model_path, "SAM 3 checkpoint")
+        assert_model_exists(sam3_repo_path, "SAM 3 repository")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = uuid.uuid4().hex[:6]
@@ -527,6 +618,7 @@ def build_tree_dataset(
     original_rgb_dir = dataset_dir / "original_rgb"
     rgb_crop_dir = dataset_dir / "rgb_crops"
     sam_dir = dataset_dir / "sam_full_logits"
+    sam3_dir = dataset_dir / "sam3_largest_tree_masks"
     depth_dir = dataset_dir / "depth_maps"
 
     dirs = [manifest_dir]
@@ -534,6 +626,8 @@ def build_tree_dataset(
         dirs.extend([original_rgb_dir, rgb_crop_dir])
     if keep_sam:
         dirs.append(sam_dir)
+    if keep_sam3:
+        dirs.append(sam3_dir)
     if keep_depth:
         dirs.append(depth_dir)
 
@@ -541,11 +635,20 @@ def build_tree_dataset(
         d.mkdir(parents=True, exist_ok=True)
 
     print(f"Building dataset in: {dataset_dir}")
-    print(f"keep_rgb={keep_rgb}, keep_sam_logits={keep_sam}, keep_depth={keep_depth}")
+    print(
+        f"keep_rgb={keep_rgb}, "
+        f"keep_sam_logits={keep_sam}, "
+        f"keep_sam3={keep_sam3}, "
+        f"keep_depth={keep_depth}"
+    )
     print(f"CLIP model: {clip_model_path}")
     print(f"DINO model: {dino_model_path}")
     if keep_sam:
         print(f"SAM checkpoint: {sam_ckpt}")
+    if keep_sam3:
+        print(f"SAM 3 checkpoint: {sam3_model_path}")
+        print(f"SAM 3 repo: {sam3_repo_path}")
+        print(f"SAM 3 prompt: {sam3_prompt}")
     if keep_depth:
         print(f"Depth checkpoint: {depth_ckpt}")
 
@@ -589,6 +692,16 @@ def build_tree_dataset(
         sam_predictor, sam_device = load_sam(sam_ckpt)
         print(f"Loaded SAM model from {sam_ckpt} on {sam_device}")
 
+    sam3_model = None
+    sam3_processor = None
+    sam3_device = None
+    if keep_sam3:
+        sam3_model, sam3_processor, sam3_device = load_sam3(
+            model_path=sam3_model_path,
+            sam3_repo_path=sam3_repo_path,
+        )
+        print(f"Loaded SAM 3 model from {sam3_model_path} on {sam3_device}")
+
     depth_model = None
     depth_device = None
     if keep_depth:
@@ -606,9 +719,17 @@ def build_tree_dataset(
     rgb_crop_paths = []
     sam_logits_paths = []
     sam_scores = []
+    sam3_mask_paths = []
+    sam3_scores = []
+    sam3_tree_boxes = []
+    sam3_area_pixels = []
+    sam3_area_ratios = []
+    sam3_n_candidates = []
     depth_paths = []
 
     box_jsons = []
+    tree_box_sources = []
+    dino_box_jsons = []
     dino_scores = []
     dino_labels = []
     dino_area_ratios = []
@@ -626,10 +747,14 @@ def build_tree_dataset(
     ):
         img = load_remote_image(row["MEDIA_SRC"])
 
-        def append_failed(reason: str, status: str = "FAILED"):
-            tree_scores.append(None)
-            top_prompts.append(reason)
-            keep_flags.append(False)
+        def append_output_failure_fields(reason: str, status: str = "FAILED"):
+            """
+            Append all output/manifest fields after CLIP has already produced
+            tree_score/top_prompt/is_tree for this row.
+
+            This prevents list-length mismatches when DINO/SAM3/depth fails after
+            the CLIP fields have already been appended.
+            """
             process_statuses.append(status)
             failure_reasons.append(reason)
 
@@ -637,18 +762,37 @@ def build_tree_dataset(
             rgb_crop_paths.append(None)
             sam_logits_paths.append(None)
             sam_scores.append(None)
+            sam3_mask_paths.append(None)
+            sam3_scores.append(None)
+            sam3_tree_boxes.append(None)
+            sam3_area_pixels.append(None)
+            sam3_area_ratios.append(None)
+            sam3_n_candidates.append(None)
             depth_paths.append(None)
 
             box_jsons.append(None)
+            tree_box_sources.append(None)
+            dino_box_jsons.append(None)
             dino_scores.append(None)
             dino_labels.append(None)
             dino_area_ratios.append(None)
             dino_full_fallbacks.append(False)
 
-            image_widths.append(None)
-            image_heights.append(None)
+            image_widths.append(img.width if img is not None else None)
+            image_heights.append(img.height if img is not None else None)
             crop_widths.append(None)
             crop_heights.append(None)
+
+
+        def append_failed(reason: str, status: str = "FAILED"):
+            """
+            Append a complete failed row before CLIP has produced row-level
+            tree_score/top_prompt/is_tree values.
+            """
+            tree_scores.append(None)
+            top_prompts.append(reason)
+            keep_flags.append(False)
+            append_output_failure_fields(reason=reason, status=status)
 
         if img is None:
             append_failed("LOAD_ERROR")
@@ -683,9 +827,17 @@ def build_tree_dataset(
             rgb_crop_paths.append(None)
             sam_logits_paths.append(None)
             sam_scores.append(None)
+            sam3_mask_paths.append(None)
+            sam3_scores.append(None)
+            sam3_tree_boxes.append(None)
+            sam3_area_pixels.append(None)
+            sam3_area_ratios.append(None)
+            sam3_n_candidates.append(None)
             depth_paths.append(None)
 
             box_jsons.append(None)
+            tree_box_sources.append(None)
+            dino_box_jsons.append(None)
             dino_scores.append(None)
             dino_labels.append(None)
             dino_area_ratios.append(None)
@@ -715,7 +867,6 @@ def build_tree_dataset(
 
             if raw_box is None:
                 expanded_box = [0, 0, img.width, img.height]
-                crop = img
                 area_ratio = 1.0
                 used_full_fallback = True
                 box_data = {
@@ -730,13 +881,80 @@ def build_tree_dataset(
                     scale_x=1.08,
                     scale_y=1.12,
                 )
-                crop = img.crop(expanded_box)
                 box_data = {
                     "raw_box": [float(v) for v in raw_box],
                     "expanded_box": [float(v) for v in expanded_box],
                 }
 
             crop_name = make_local_filename(row)
+
+            # DINO is always preserved, but SAM 3 can become the preferred crop source.
+            dino_box_data = box_data
+            final_box_data = box_data
+            final_crop_box = expanded_box
+            tree_box_source = "DINO"
+
+            sam3_mask_path = None
+            sam3_score = None
+            sam3_tree_box_json = None
+            sam3_area_pixel_value = None
+            sam3_area_ratio_value = None
+            sam3_n_candidate_value = None
+
+            if keep_sam3:
+                sam3_result = infer_sam3_tree_candidates(
+                    img,
+                    model=sam3_model,
+                    processor=sam3_processor,
+                    device=sam3_device,
+                    prompt=sam3_prompt,
+                    min_score=sam3_min_score,
+                )
+
+                selected_sam3 = select_largest_sam3_candidate(
+                    sam3_result,
+                    image_size=img.size,
+                )
+
+                sam3_box = selected_sam3["box"]
+                sam3_mask = selected_sam3["mask"]
+                sam3_score = selected_sam3["score"]
+                sam3_area_pixel_value = selected_sam3["area_pixels"]
+                sam3_area_ratio_value = selected_sam3["area_ratio"]
+                sam3_n_candidate_value = selected_sam3["n_candidates"]
+
+                if sam3_box is not None:
+                    sam3_expanded_box = expand_box_for_context(
+                        sam3_box,
+                        img.size,
+                        scale_x=1.08,
+                        scale_y=1.12,
+                    )
+
+                    sam3_tree_box_data = {
+                        "raw_box": [float(v) for v in sam3_box],
+                        "expanded_box": [float(v) for v in sam3_expanded_box],
+                        "selection": "largest_area",
+                        "prompt": sam3_prompt,
+                    }
+
+                    sam3_tree_box_json = json.dumps(sam3_tree_box_data)
+
+                    final_box_data = sam3_tree_box_data
+                    final_crop_box = sam3_expanded_box
+                    tree_box_source = "SAM3_LARGEST_AREA"
+
+                if sam3_mask is not None:
+                    sam3_mask_path = sam3_dir / crop_name.replace(
+                        ".jpg",
+                        "_sam3_largest_tree_mask.npy",
+                    )
+                    np.save(
+                        sam3_mask_path,
+                        np.asarray(sam3_mask).astype(np.uint8),
+                    )
+
+            crop = img.crop(final_crop_box)
 
             original_rgb_path = None
             rgb_crop_path = None
@@ -778,9 +996,29 @@ def build_tree_dataset(
             rgb_crop_paths.append(str(rgb_crop_path) if rgb_crop_path is not None else None)
             sam_logits_paths.append(str(sam_logits_path) if sam_logits_path is not None else None)
             sam_scores.append(float(sam_score) if sam_score is not None else None)
+            sam3_mask_paths.append(str(sam3_mask_path) if sam3_mask_path is not None else None)
+            sam3_scores.append(float(sam3_score) if sam3_score is not None else None)
+            sam3_tree_boxes.append(sam3_tree_box_json)
+            sam3_area_pixels.append(
+                float(sam3_area_pixel_value)
+                if sam3_area_pixel_value is not None
+                else None
+            )
+            sam3_area_ratios.append(
+                float(sam3_area_ratio_value)
+                if sam3_area_ratio_value is not None
+                else None
+            )
+            sam3_n_candidates.append(
+                int(sam3_n_candidate_value)
+                if sam3_n_candidate_value is not None
+                else None
+            )
             depth_paths.append(str(depth_path) if depth_path is not None else None)
 
-            box_jsons.append(json.dumps(box_data))
+            box_jsons.append(json.dumps(final_box_data))
+            tree_box_sources.append(tree_box_source)
+            dino_box_jsons.append(json.dumps(dino_box_data))
             dino_scores.append(float(dino_score) if dino_score is not None else None)
             dino_labels.append(dino_label)
             dino_area_ratios.append(float(area_ratio))
@@ -796,7 +1034,12 @@ def build_tree_dataset(
 
         except Exception as e:
             print(f"Processing failed for {row.get('IMAGE_ID')}: {e}")
-            append_failed(f"PROCESSING_ERROR: {e}")
+
+            # CLIP fields were already appended for this row, so only append
+            # the remaining output/failure fields. Do NOT call append_failed()
+            # here, otherwise tree_scores/top_prompts/keep_flags become longer
+            # than df_img.
+            append_output_failure_fields(f"PROCESSING_ERROR: {e}")
 
     df_img["tree_score"] = tree_scores
     df_img["top_prompt"] = top_prompts
@@ -808,9 +1051,17 @@ def build_tree_dataset(
     df_img["RGB_CROP_PATH"] = rgb_crop_paths
     df_img["SAM_LOGITS_PATH"] = sam_logits_paths
     df_img["SAM_SCORE"] = sam_scores
+    df_img["SAM3_MASK_PATH"] = sam3_mask_paths
+    df_img["SAM3_SCORE"] = sam3_scores
+    df_img["SAM3_TREE_BOX"] = sam3_tree_boxes
+    df_img["SAM3_AREA_PIXELS"] = sam3_area_pixels
+    df_img["SAM3_AREA_RATIO"] = sam3_area_ratios
+    df_img["SAM3_N_CANDIDATES"] = sam3_n_candidates
     df_img["DEPTH_PATH"] = depth_paths
 
     df_img["TREE_BOX"] = box_jsons
+    df_img["TREE_BOX_SOURCE"] = tree_box_sources
+    df_img["DINO_TREE_BOX"] = dino_box_jsons
     df_img["DINO_SCORE"] = dino_scores
     df_img["DINO_LABEL"] = dino_labels
     df_img["DINO_AREA_RATIO"] = dino_area_ratios
@@ -833,6 +1084,8 @@ def build_tree_dataset(
     if keep_sam:
         valid = valid & df_img["SAM_LOGITS_PATH"].notna()
 
+    # keep_sam3 does not make rows invalid if SAM 3 finds no candidate:
+    # those rows fall back to DINO and are recorded with TREE_BOX_SOURCE="DINO".
     if keep_depth:
         valid = valid & df_img["DEPTH_PATH"].notna()
 
@@ -901,6 +1154,7 @@ def build_tree_dataset(
         "input_file": str(input_path),
         "keep_rgb": keep_rgb,
         "keep_sam_logits": keep_sam,
+        "keep_sam3": keep_sam3,
         "keep_depth": keep_depth,
         "clip_threshold": clip_threshold,
         "dino_threshold": dino_threshold,
@@ -913,6 +1167,10 @@ def build_tree_dataset(
         "clip_model_path": str(clip_model_path),
         "dino_model_path": str(dino_model_path),
         "sam_ckpt": str(sam_ckpt) if sam_ckpt is not None else None,
+        "sam3_model_path": str(sam3_model_path) if sam3_model_path is not None else None,
+        "sam3_repo_path": str(sam3_repo_path) if sam3_repo_path is not None else None,
+        "sam3_prompt": sam3_prompt,
+        "sam3_min_score": sam3_min_score,
         "depth_ckpt": str(depth_ckpt) if depth_ckpt is not None else None,
         "n_raw_rows": int(n_raw_rows),
         "n_raw_tree_yes_rows": n_raw_tree_yes_rows,
@@ -949,6 +1207,34 @@ def build_tree_dataset(
         "sam_score_mean_final": safe_float_mean(df_final["SAM_SCORE"]) if keep_sam and len(df_final) else None,
         "sam_score_min_final": safe_float_min(df_final["SAM_SCORE"]) if keep_sam and len(df_final) else None,
         "sam_score_max_final": safe_float_max(df_final["SAM_SCORE"]) if keep_sam and len(df_final) else None,
+        "n_sam3_success_final": int(df_final["SAM3_TREE_BOX"].notna().sum())
+        if keep_sam3 and "SAM3_TREE_BOX" in df_final.columns
+        else 0,
+        "n_tree_box_source_sam3_final": int(
+            (df_final["TREE_BOX_SOURCE"] == "SAM3_LARGEST_AREA").sum()
+        )
+        if keep_sam3 and "TREE_BOX_SOURCE" in df_final.columns
+        else 0,
+        "n_tree_box_source_dino_final": int(
+            (df_final["TREE_BOX_SOURCE"] == "DINO").sum()
+        )
+        if "TREE_BOX_SOURCE" in df_final.columns
+        else 0,
+        "sam3_score_mean_final": safe_float_mean(df_final["SAM3_SCORE"])
+        if keep_sam3 and len(df_final)
+        else None,
+        "sam3_score_min_final": safe_float_min(df_final["SAM3_SCORE"])
+        if keep_sam3 and len(df_final)
+        else None,
+        "sam3_score_max_final": safe_float_max(df_final["SAM3_SCORE"])
+        if keep_sam3 and len(df_final)
+        else None,
+        "sam3_area_ratio_mean_final": safe_float_mean(df_final["SAM3_AREA_RATIO"])
+        if keep_sam3 and len(df_final)
+        else None,
+        "sam3_area_ratio_max_final": safe_float_max(df_final["SAM3_AREA_RATIO"])
+        if keep_sam3 and len(df_final)
+        else None,
         "dino_score_mean_final": safe_float_mean(df_final["DINO_SCORE"]) if len(df_final) else None,
         "dino_score_min_final": safe_float_min(df_final["DINO_SCORE"]) if len(df_final) else None,
         "dino_score_max_final": safe_float_max(df_final["DINO_SCORE"]) if len(df_final) else None,

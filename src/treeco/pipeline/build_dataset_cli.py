@@ -17,6 +17,7 @@ def main():
     ap.add_argument("--no_keep_rgb", action="store_false", dest="keep_rgb")
 
     ap.add_argument("--keep_sam", action="store_true")
+    ap.add_argument("--keep_sam3", action="store_true")
     ap.add_argument("--keep_depth", action="store_true")
 
     ap.add_argument("--clip_model_path", default=None)
@@ -41,6 +42,7 @@ def main():
         dataset_name=args.dataset_name,
         keep_rgb=args.keep_rgb,
         keep_sam=args.keep_sam,
+        keep_sam3=args.keep_sam3,
         keep_depth=args.keep_depth,
         clip_model_path=clip_model_path,
         clip_threshold=args.clip_threshold,

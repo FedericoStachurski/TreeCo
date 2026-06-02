@@ -31,4 +31,21 @@ MODEL_REGISTRY = {
         "filename": "depth_anything_v2_vitb.pth",
         "local_dir": "depth_anything_v2_vitb",
     },
+    # New SAM 3 code repository
+    "sam3_repo": {
+        "display_name": "SAM 3 Repository",
+        "type": "git_clone",
+        "repo_url": "https://github.com/facebookresearch/sam3.git",
+        "local_dir": "sam3",
+    },
+
+    # New SAM 3 / SAM 3.1 checkpoint
+    # NOTE: gated Hugging Face model. Requires access approval + hf auth login.
+    "sam3": {
+        "display_name": "SAM 3.1 Checkpoint",
+        "type": "huggingface_snapshot",
+        "repo_id": "facebook/sam3.1",
+        "local_dir": "sam3_1",
+        "requires_hf_token": True,
+    },
 }

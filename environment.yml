@@ -20,6 +20,7 @@ dependencies:
   - ipykernel
   - jupyterlab
 
+
   - pip:
       - torch
       - torchvision
@@ -31,4 +32,6 @@ dependencies:
       - opencv-python-headless
       - openpyxl
       - huggingface_hub
+      - einops
+      - pycocotools
       - git+https://github.com/facebookresearch/segment-anything.git
