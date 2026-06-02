@@ -32,4 +32,3 @@ dependencies:
       - openpyxl
       - huggingface_hub
       - git+https://github.com/facebookresearch/segment-anything.git
-      - git+https://github.com/DepthAnything/Depth-Anything-V2.git
