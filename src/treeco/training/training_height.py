@@ -35,8 +35,37 @@ INPUT_CHANNELS = {
     "rgb_depth": 4,
     "rgb_sam": 4,
     "rgb_sam_depth": 5,
+    "rgb_sam3": 4,
+    "rgb_sam3_depth": 5,
+
 }
 
+
+class FocalLoss(nn.Module):
+    def __init__(
+        self,
+        alpha=None,
+        gamma: float = 2.0,
+        label_smoothing: float = 0.0,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits, targets):
+        ce_loss = nn.functional.cross_entropy(
+            logits,
+            targets,
+            weight=self.alpha,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
+
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1.0 - pt) ** self.gamma) * ce_loss
+
+        return focal_loss.mean()
 
 class TreeHeightDataset(Dataset):
     def __init__(
@@ -56,8 +85,22 @@ class TreeHeightDataset(Dataset):
         if input_mode not in INPUT_CHANNELS:
             raise ValueError(f"Unknown input_mode: {input_mode}")
 
-        self.use_depth = input_mode in {"rgb_depth", "rgb_sam_depth"}
-        self.use_sam = input_mode in {"rgb_sam", "rgb_sam_depth"}
+        self.use_depth = input_mode in {
+            "rgb_depth",
+            "rgb_sam_depth",
+            "rgb_sam3_depth",
+            "sam3_depth",
+        }
+
+        self.use_sam = input_mode in {
+            "rgb_sam",
+            "rgb_sam_depth",
+        }
+
+        self.use_sam3 = input_mode in {
+            "rgb_sam3",
+            "rgb_sam3_depth",
+        }
 
         if image_source == "crop":
             self.rgb_col = "RGB_CROP_PATH"
@@ -181,6 +224,11 @@ class TreeHeightDataset(Dataset):
         if self.use_sam:
             single_channels.append(
                 self._load_single_channel_image(row["SAM_LOGITS_PATH"])
+            )
+        
+        if self.use_sam3:
+            single_channels.append(
+                self._load_single_channel_image(row["SAM3_MASK_PATH"])
             )
 
         if self.use_depth:
@@ -350,6 +398,7 @@ def load_manifest(dataset_dir: Path) -> pd.DataFrame:
     optional_cols = [
         "ORIGINAL_RGB_PATH",
         "SAM_LOGITS_PATH",
+        "SAM3_MASK_PATH",
         "DEPTH_PATH",
     ]
 
@@ -408,7 +457,7 @@ def filter_manifest_for_inputs(
     df = df[df[rgb_col].apply(lambda p: Path(str(p)).exists())].copy()
 
     # Depth requirements
-    if input_mode in {"rgb_depth", "rgb_sam_depth"}:
+    if input_mode in {"rgb_depth", "rgb_sam_depth", "rgb_sam3_depth"}:
         df = df[df["DEPTH_PATH"].notna()].copy()
         df = df[
             df["DEPTH_PATH"].apply(lambda p: Path(str(p)).exists())
@@ -420,6 +469,13 @@ def filter_manifest_for_inputs(
         df = df[
             df["SAM_LOGITS_PATH"].apply(lambda p: Path(str(p)).exists())
         ].copy()
+
+    #SAM3 requirements
+    if input_mode in {"rgb_sam3", "rgb_sam3_depth"}:
+        df = df[df["SAM3_MASK_PATH"].notna()].copy()
+        df = df[
+            df["SAM3_MASK_PATH"].apply(lambda p: Path(str(p)).exists())
+        ].copy()    
 
     df = df.drop_duplicates(subset=[rgb_col]).reset_index(drop=True)
 
@@ -469,14 +525,14 @@ def main():
         "--input_mode",
         type=str,
         default="rgb",
-        choices=["rgb", "rgb_depth", "rgb_sam", "rgb_sam_depth"],
+        choices=["rgb", "rgb_depth", "rgb_sam", "rgb_sam_depth", "rgb_sam3", "rgb_sam3_depth", "sam3_depth"],
         help="Model inputs: RGB only, RGB+Depth, RGB+SAM, or RGB+SAM+Depth.",
     )
 
     ap.add_argument(
         "--image_source",
         type=str,
-        default="crop",
+        default="full",
         choices=["crop", "full"],
         help="Use DINO-cropped RGB image or full original RGB image.",
     )
@@ -490,6 +546,8 @@ def main():
     ap.add_argument("--val_size", type=float, default=0.2)
     ap.add_argument("--random_state", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--criterion", type=str, default="cross_entropy", choices=["cross_entropy", "focal", "weighted_ce"])
+    ap.add_argument("--scheduler", type=str, default=None, choices=["none", "plateau", "cosine", "step", "onecycle"])
 
     args = ap.parse_args()
 
@@ -622,10 +680,21 @@ def main():
         dropout_rate=args.dropout_rate,
     )
 
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights,
-        label_smoothing=0.1,
-    )
+    if args.criterion == "cross_entropy":
+        criterion = nn.CrossEntropyLoss(
+            label_smoothing=0.1,
+        )
+    elif args.criterion == "focal":
+        criterion = FocalLoss(
+            weight=class_weights,
+            alpha=1,
+            gamma=2,
+        )
+    elif args.criterion == "weighted_ce":
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=0.1,
+        )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -633,12 +702,32 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=4,
-    )
+    if args.scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=4,
+        )
+    elif args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+        )
+    elif args.scheduler == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=10,
+            gamma=0.5,
+        )
+    elif args.scheduler == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=args.lr,
+            total_steps=args.epochs * len(train_loader),
+        )
+    else:
+        scheduler = None
 
     models_root = out_root / "tree_height_models"
     models_root.mkdir(parents=True, exist_ok=True)
@@ -672,8 +761,8 @@ def main():
         "in_channels": in_channels,
         "input_mode": args.input_mode,
         "image_source": args.image_source,
-        "use_depth": args.input_mode in {"rgb_depth", "rgb_sam_depth"},
-        "use_sam": args.input_mode in {"rgb_sam", "rgb_sam_depth"},
+        "use_depth": args.input_mode in {"rgb_depth", "rgb_sam_depth", "rgb_sam3_depth", "sam3_depth"},
+        "use_sam": args.input_mode in {"rgb_sam", "rgb_sam_depth", "rgb_sam3", "sam3_depth"},
         "image_size": args.image_size,
         "batch_size": args.batch_size,
         "dropout_rate": args.dropout_rate,
@@ -686,6 +775,7 @@ def main():
         "class_weighted_loss": True,
         "device": str(device),
         "height_class_mapping": class_mapping,
+        "scheduler": args.scheduler if hasattr(args, "scheduler") else "none",
     }
 
     with open(config_path, "w") as f:
@@ -737,7 +827,11 @@ def main():
             zero_division=0,
         )
 
-        scheduler.step(val_f1_macro)
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_f1_macro)
+            else:
+                scheduler.step()
 
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -754,7 +848,7 @@ def main():
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
             f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} | "
             f"val_f1={val_f1_macro:.4f} val_recall={val_recall_macro:.4f} | "
-            f"lr={current_lr:.2e}"
+            f"lr={current_lr:.4e}"
         )
 
         checkpoint = {
@@ -770,6 +864,7 @@ def main():
             "val_accuracy": float(val_acc),
             "val_f1_macro": float(val_f1_macro),
             "val_recall_macro": float(val_recall_macro),
+            "scheduler": args.scheduler if hasattr(args, "scheduler") else "none",
         }
 
         torch.save(checkpoint, last_model_path)

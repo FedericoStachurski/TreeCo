@@ -33,6 +33,8 @@ INPUT_CHANNELS = {
     "rgb_depth": 4,
     "rgb_sam": 4,
     "rgb_sam_depth": 5,
+    "rgb_sam3": 4,
+    "rgb_sam3_depth": 5,
 }
 
 
@@ -54,8 +56,9 @@ class TreeDBHDataset(Dataset):
         if input_mode not in INPUT_CHANNELS:
             raise ValueError(f"Unknown input_mode: {input_mode}")
 
-        self.use_depth = input_mode in {"rgb_depth", "rgb_sam_depth"}
+        self.use_depth = input_mode in {"rgb_depth", "rgb_sam_depth", "rgb_sam3_depth"}
         self.use_sam = input_mode in {"rgb_sam", "rgb_sam_depth"}
+        self.use_sam3 = input_mode in {"rgb_sam3", "rgb_sam3_depth"}
 
         if image_source == "crop":
             self.rgb_col = "RGB_CROP_PATH"
@@ -172,6 +175,11 @@ class TreeDBHDataset(Dataset):
         if self.use_sam:
             single_channels.append(
                 self._load_single_channel_image(row["SAM_LOGITS_PATH"])
+            )
+
+        if self.use_sam3:
+            single_channels.append(
+                self._load_single_channel_image(row["SAM3_MASK_PATH"])
             )
 
         if self.use_depth:
@@ -342,6 +350,7 @@ def load_manifest(dataset_dir: Path) -> pd.DataFrame:
         "ORIGINAL_RGB_PATH",
         "SAM_LOGITS_PATH",
         "DEPTH_PATH",
+        "SAM3_MASK_PATH",
     ]
 
     for col in optional_cols:
@@ -361,6 +370,8 @@ def load_manifest(dataset_dir: Path) -> pd.DataFrame:
 
     # Optional sanity filter: removes zero/negative weird labels
     df = df[df["DBH_CM"] > 0].copy()
+
+    
 
     return df.reset_index(drop=True)
 
@@ -382,13 +393,17 @@ def filter_manifest_for_inputs(
     df = df[df[rgb_col].notna()].copy()
     df = df[df[rgb_col].apply(lambda p: Path(str(p)).exists())].copy()
 
-    if input_mode in {"rgb_depth", "rgb_sam_depth"}:
+    if input_mode in {"rgb_depth", "rgb_sam_depth", "rgb_sam3_depth"}:
         df = df[df["DEPTH_PATH"].notna()].copy()
         df = df[df["DEPTH_PATH"].apply(lambda p: Path(str(p)).exists())].copy()
 
     if input_mode in {"rgb_sam", "rgb_sam_depth"}:
         df = df[df["SAM_LOGITS_PATH"].notna()].copy()
         df = df[df["SAM_LOGITS_PATH"].apply(lambda p: Path(str(p)).exists())].copy()
+
+    if input_mode in {"rgb_sam3", "rgb_sam3_depth"}:
+        df = df[df["SAM3_MASK_PATH"].notna()].copy()
+        df = df[df["SAM3_MASK_PATH"].apply(lambda p: Path(str(p)).exists())].copy()
 
     df = df.drop_duplicates(subset=[rgb_col]).reset_index(drop=True)
 
@@ -448,13 +463,13 @@ def main():
         "--input_mode",
         type=str,
         default="rgb",
-        choices=["rgb", "rgb_depth", "rgb_sam", "rgb_sam_depth"],
+        choices=["rgb", "rgb_depth", "rgb_sam", "rgb_sam_depth", "rgb_sam3", "rgb_sam3_depth"],
     )
 
     ap.add_argument(
         "--image_source",
         type=str,
-        default="crop",
+        default="full",
         choices=["crop", "full"],
     )
 
@@ -467,6 +482,8 @@ def main():
     ap.add_argument("--val_size", type=float, default=0.2)
     ap.add_argument("--random_state", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--criterion", type=str, default="huber", choices=["huber", "smoothl1"])
+    ap.add_argument("--scheduler", type=str, default=None, choices=["none", "plateau", "cosine", "step", "onecycle"])
 
     args = ap.parse_args()
 
@@ -580,7 +597,10 @@ def main():
         dropout_rate=args.dropout_rate,
     )
 
-    criterion = nn.SmoothL1Loss()
+    if args.criterion == "smoothl1":
+        criterion = nn.SmoothL1Loss(beta=1.0)
+    else:
+            criterion = nn.HuberLoss(delta=5.0)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -588,12 +608,32 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=4,
-    )
+    if args.scheduler == "plateau": 
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=4,
+        )
+    elif args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+        )
+    elif args.scheduler == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=10,
+            gamma=0.1,
+        )
+    elif args.scheduler == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=args.lr,
+            total_steps=args.epochs * len(train_loader),
+        )
+    else:
+        scheduler = None
 
     models_root = out_root / "tree_dbh_models"
     models_root.mkdir(parents=True, exist_ok=True)
@@ -625,8 +665,8 @@ def main():
         "in_channels": in_channels,
         "input_mode": args.input_mode,
         "image_source": args.image_source,
-        "use_depth": args.input_mode in {"rgb_depth", "rgb_sam_depth"},
-        "use_sam": args.input_mode in {"rgb_sam", "rgb_sam_depth"},
+        "use_depth": args.input_mode in {"rgb_depth", "rgb_sam_depth", "rgb_sam3_depth"},
+        "use_sam": args.input_mode in {"rgb_sam", "rgb_sam_depth", "rgb_sam3", "rgb_sam3_depth"},
         "image_size": args.image_size,
         "batch_size": args.batch_size,
         "dropout_rate": args.dropout_rate,
@@ -636,7 +676,7 @@ def main():
         "val_size": args.val_size,
         "random_state": args.random_state,
         "num_workers": args.num_workers,
-        "loss": "SmoothL1Loss",
+        "loss": args.criterion if hasattr(args, "criterion") else "huber",
         "device": str(device),
     }
 
@@ -677,7 +717,8 @@ def main():
             optimizer=None,
         )
 
-        scheduler.step(val_mae)
+        if scheduler is not None:
+            scheduler.step(val_mae)
 
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -704,6 +745,7 @@ def main():
             "model_state_dict": model.state_dict(),
             "epoch": epoch + 1,
             "backbone": args.backbone,
+            "scheduler": args.scheduler if hasattr(args, "scheduler") else "none",
             "in_channels": in_channels,
             "input_mode": args.input_mode,
             "image_source": args.image_source,
