@@ -623,16 +623,13 @@ def main():
     print(f"Train images: {len(train_df)}")
     print(f"Val images: {len(val_df)}")
 
-    classes = np.sort(train_df["HEIGHT_CLASS_IDX"].unique())
+    counts = train_df["HEIGHT_CLASS_IDX"].value_counts().reindex([0, 1, 2, 3]).fillna(0)
 
-    class_weights_np = compute_class_weight(
-        class_weight="balanced",
-        classes=classes,
-        y=train_df["HEIGHT_CLASS_IDX"],
-    )
+    weights = 1.0 / np.sqrt(counts.values)
+    weights = weights / weights.mean()
 
     class_weights = torch.tensor(
-        class_weights_np,
+        weights,
         dtype=torch.float32,
         device=device,
     )
@@ -704,11 +701,11 @@ def main():
 
     if args.scheduler == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="max",
-            factor=0.5,
-            patience=4,
-        )
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=4,
+    )
     elif args.scheduler == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,

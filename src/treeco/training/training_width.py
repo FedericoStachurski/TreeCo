@@ -7,6 +7,7 @@ import random
 from datetime import datetime
 from pathlib import Path
 
+
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -46,11 +47,13 @@ class TreeDBHDataset(Dataset):
         input_mode: str = "rgb",
         image_source: str = "crop",
         train: bool = True,
+        use_log1p: bool = False,
     ):
         self.df = df.reset_index(drop=True)
         self.image_size = image_size
         self.input_mode = input_mode
         self.image_source = image_source
+        self.use_log1p = use_log1p
         self.train = train
 
         if input_mode not in INPUT_CHANNELS:
@@ -200,8 +203,14 @@ class TreeDBHDataset(Dataset):
 
         x = torch.cat(channels, dim=0)
 
-        # Continuous regression target: diameter / DBH in cm
-        y = torch.tensor(float(row["DBH_CM"]), dtype=torch.float32)
+        dbh_cm = float(row["DBH_CM"])
+
+        if self.use_log1p:
+            target = np.log1p(dbh_cm)
+        else:
+            target = dbh_cm
+
+        y = torch.tensor(target, dtype=torch.float32)
 
         return x, y
 
@@ -261,13 +270,14 @@ def run_epoch(
     criterion,
     device: torch.device,
     optimizer=None,
+    use_log1p: bool = False,
 ):
     train_mode = optimizer is not None
     model.train() if train_mode else model.eval()
 
     total_loss = 0.0
-    all_preds = []
-    all_targets = []
+    all_preds_raw = []
+    all_targets_raw = []
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -278,6 +288,9 @@ def run_epoch(
 
         with torch.set_grad_enabled(train_mode):
             preds = model(x).squeeze(1)
+
+            # Loss is computed in the target space:
+            # raw DBH if use_log1p=False, log1p(DBH) if use_log1p=True.
             loss = criterion(preds, y)
 
             if train_mode:
@@ -285,13 +298,25 @@ def run_epoch(
                 optimizer.step()
 
         total_loss += loss.item() * x.size(0)
-        all_preds.extend(preds.detach().cpu().numpy())
-        all_targets.extend(y.detach().cpu().numpy())
+        all_preds_raw.extend(preds.detach().cpu().numpy())
+        all_targets_raw.extend(y.detach().cpu().numpy())
 
-    all_preds = np.array(all_preds, dtype=np.float32)
-    all_targets = np.array(all_targets, dtype=np.float32)
+    all_preds_raw = np.array(all_preds_raw, dtype=np.float32)
+    all_targets_raw = np.array(all_targets_raw, dtype=np.float32)
 
-    avg_loss = total_loss / max(len(all_targets), 1)
+    avg_loss = total_loss / max(len(all_targets_raw), 1)
+
+    # Metrics are always computed in real DBH cm.
+    if use_log1p:
+        all_preds = np.expm1(all_preds_raw)
+        all_targets = np.expm1(all_targets_raw)
+
+        # Prevent negative DBH values if the network predicts log values below 0.
+        all_preds = np.clip(all_preds, 0, None)
+        all_targets = np.clip(all_targets, 0, None)
+    else:
+        all_preds = all_preds_raw
+        all_targets = all_targets_raw
 
     mae = mean_absolute_error(all_targets, all_preds)
     rmse = mean_squared_error(all_targets, all_preds) ** 0.5
@@ -473,6 +498,10 @@ def main():
         choices=["crop", "full"],
     )
 
+    ap.add_argument("--use_log1p", action="store_true",
+                    help="Whether to apply log1p transformation to the target DBH values. " \
+                    "This can help stabilize training when there is a wide range of DBH values.")
+
     ap.add_argument("--image_size", type=int, default=224)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--dropout_rate", type=float, default=0.1)
@@ -483,7 +512,7 @@ def main():
     ap.add_argument("--random_state", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--criterion", type=str, default="huber", choices=["huber", "smoothl1"])
-    ap.add_argument("--scheduler", type=str, default=None, choices=["none", "plateau", "cosine", "step", "onecycle"])
+    ap.add_argument("--scheduler", type=str, default=None, choices=["none", "plateau", "cosine", "step"])
 
     args = ap.parse_args()
 
@@ -532,6 +561,9 @@ def main():
         .reset_index(drop=True)
     )
 
+    if args.use_log1p:
+        tree_df["DBH_CM"] = np.log1p(tree_df["DBH_CM"])
+
     stratify_bins = make_regression_stratification_bins(tree_df)
 
     train_tree_ids, val_tree_ids = train_test_split(
@@ -562,6 +594,7 @@ def main():
         input_mode=args.input_mode,
         image_source=args.image_source,
         train=True,
+        use_log1p=args.use_log1p,
     )
 
     val_ds = TreeDBHDataset(
@@ -570,6 +603,7 @@ def main():
         input_mode=args.input_mode,
         image_source=args.image_source,
         train=False,
+        use_log1p=args.use_log1p,
     )
 
     train_loader = DataLoader(
@@ -626,12 +660,6 @@ def main():
             step_size=10,
             gamma=0.1,
         )
-    elif args.scheduler == "onecycle":
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=args.lr,
-            total_steps=args.epochs * len(train_loader),
-        )
     else:
         scheduler = None
 
@@ -678,6 +706,7 @@ def main():
         "num_workers": args.num_workers,
         "loss": args.criterion if hasattr(args, "criterion") else "huber",
         "device": str(device),
+        "use_log1p": args.use_log1p,
     }
 
     with open(config_path, "w") as f:
@@ -707,6 +736,7 @@ def main():
             criterion=criterion,
             device=device,
             optimizer=optimizer,
+            use_log1p=args.use_log1p,
         )
 
         val_loss, val_mae, val_rmse, val_r2, val_preds, val_targets = run_epoch(
@@ -715,10 +745,14 @@ def main():
             criterion=criterion,
             device=device,
             optimizer=None,
+            use_log1p=args.use_log1p,
         )
 
         if scheduler is not None:
-            scheduler.step(val_mae)
+            if args.scheduler == "plateau":
+                scheduler.step(val_mae)
+            else:
+                scheduler.step()
 
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -783,6 +817,7 @@ def main():
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=4)
 
+
     np.save(run_dir / "val_targets_dbh_cm.npy", val_targets)
     np.save(run_dir / "val_preds_dbh_cm.npy", val_preds)
     np.save(run_dir / "val_labels.npy", val_targets)
@@ -790,7 +825,7 @@ def main():
 
     pred_df = val_df[["ID", "IMAGE_ID", "DBH_CM"]].copy()
     pred_df["PRED_DBH_CM"] = val_preds
-    pred_df["ABS_ERROR_CM"] = (pred_df["PRED_DBH_CM"] - pred_df["DBH_CM"]).abs()
+    pred_df["ABS_ERROR_DBH_CM"] = (pred_df["PRED_DBH_CM"] - pred_df["DBH_CM"]).abs()
     pred_df.to_csv(run_dir / "val_predictions.csv", index=False)
 
     print("\nTraining complete.")
