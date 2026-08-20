@@ -16,6 +16,8 @@ dist/
 
 # Jupyter
 .ipynb_checkpoints/
+notebooks/
+
 
 # =========================
 # Project data
