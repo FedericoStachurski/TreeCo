@@ -45,6 +45,9 @@ treeco-infer-widths-species = "treeco.inference.infer_widths_species_cli:main"
 treeco-combine-height-width = "treeco.utils.combine_height_width_cli:main"
 treeco-make-map = "treeco.mapping.make_map_cli:main"
 treeco-rawdata-make-map = "treeco.mapping.raw_data_make_map_cli:main" 
+
+treeco-train-width-species-ENCODER = "treeco.training.training_DBH_species_encoder_cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["treeco*"]
