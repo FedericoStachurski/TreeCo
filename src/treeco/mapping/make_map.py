@@ -185,33 +185,114 @@ def pick_height(row):
 
 def pick_diameter(row, pred_is_circumference=False):
     """
-    Prefer observed DBH_CM if present.
-    Otherwise use DBH_CM_PRED.
+    Select the best available DBH.
 
-    If DBH_CM_PRED is actually circumference in cm, use:
-      --pred-is-circumference
+    Priority:
+      1. DBH_CM_FINAL
+         - observed DBH where available
+         - otherwise tree-level inferred DBH
 
-    This converts predicted circumference to diameter by dividing by pi.
+      2. Legacy observed DBH_CM
+
+      3. Legacy cleaned circumference converted to DBH
+
+      4. Legacy DBH_CM_PRED
+
+    DBH_CM_FINAL is already diameter in cm and must NOT
+    be divided by pi.
     """
-    observed_dbh = pd.to_numeric(row.get("DBH_CM"), errors="coerce")
 
-    if pd.notna(observed_dbh):
-        return observed_dbh, max(0.1 * observed_dbh, 2.0), "observed_dbh"
+    # =====================================================
+    # New TreeCo pipeline: preferred final DBH
+    # =====================================================
+    final_dbh = pd.to_numeric(
+        row.get("DBH_CM_FINAL"),
+        errors="coerce",
+    )
 
-    circumference_clean = pd.to_numeric(row.get("CIRCUMFERENCE_CM_CLEAN"), errors="coerce")
+    if pd.notna(final_dbh) and final_dbh > 0:
 
-    if pd.notna(circumference_clean):
-        diameter = circumference_clean / np.pi
-        return diameter, max(0.1 * diameter, 2.0), "observed_circumference_converted"
+        # Work out whether DBH_CM_FINAL came from an
+        # observation or from the width model.
+        observed_final = pd.to_numeric(
+            row.get("DBH_CM_OBSERVED"),
+            errors="coerce",
+        )
 
-    pred = pd.to_numeric(row.get("DBH_CM_PRED"), errors="coerce")
+        if pd.notna(observed_final) and observed_final > 0:
+            return (
+                float(final_dbh),
+                max(0.10 * float(final_dbh), 2.0),
+                "observed_dbh_final",
+            )
 
-    if pd.notna(pred):
+        return (
+            float(final_dbh),
+            max(0.15 * float(final_dbh), 3.0),
+            "model_inferred_dbh_final",
+        )
+
+    # =====================================================
+    # Legacy fallback: directly observed DBH
+    # =====================================================
+    observed_dbh = pd.to_numeric(
+        row.get("DBH_CM"),
+        errors="coerce",
+    )
+
+    if pd.notna(observed_dbh) and observed_dbh > 0:
+        return (
+            float(observed_dbh),
+            max(0.10 * float(observed_dbh), 2.0),
+            "observed_dbh",
+        )
+
+    # =====================================================
+    # Legacy fallback: observed circumference
+    # =====================================================
+    circumference_clean = pd.to_numeric(
+        row.get("CIRCUMFERENCE_CM_CLEAN"),
+        errors="coerce",
+    )
+
+    if (
+        pd.notna(circumference_clean)
+        and circumference_clean > 0
+    ):
+        diameter = float(circumference_clean) / np.pi
+
+        return (
+            diameter,
+            max(0.10 * diameter, 2.0),
+            "observed_circumference_converted",
+        )
+
+    # =====================================================
+    # Legacy predicted DBH
+    # =====================================================
+    pred = pd.to_numeric(
+        row.get("DBH_CM_PRED"),
+        errors="coerce",
+    )
+
+    if pd.notna(pred) and pred > 0:
+
+        pred = float(pred)
+
         if pred_is_circumference:
             diameter = pred / np.pi
-            return diameter, max(0.15 * diameter, 3.0), "model_inferred_circumference_converted"
 
-        return pred, max(0.15 * pred, 3.0), "model_inferred_dbh"
+            return (
+                diameter,
+                max(0.15 * diameter, 3.0),
+                "model_inferred_circumference_converted",
+            )
+
+        return (
+            pred,
+            max(0.15 * pred, 3.0),
+            "model_inferred_dbh",
+        )
 
     return np.nan, np.nan, "missing"
 
@@ -354,6 +435,7 @@ def build_carbon_table(
 
 def make_image_scroller(image_urls, color):
     import re
+    import hashlib
 
     if image_urls is None:
         return ""
@@ -361,57 +443,168 @@ def make_image_scroller(image_urls, color):
     if isinstance(image_urls, list):
         urls = image_urls
     else:
-        urls = re.findall(r'https?://[^\s,"\']+', str(image_urls))
+        urls = re.findall(
+            r'https?://[^\s,"\']+',
+            str(image_urls),
+        )
 
-    urls = [u.strip() for u in urls if str(u).startswith("http")]
+    urls = [
+        u.strip()
+        for u in urls
+        if str(u).startswith("http")
+    ]
 
     if not urls:
         return ""
 
-    first = urls[0]
+    # Unique ID so sliders from different tree popups
+    # do not interfere with each other.
+    uid = hashlib.md5(
+        "|".join(urls).encode("utf-8")
+    ).hexdigest()[:10]
 
-    extra_links = "".join([
-        f'''
-        <a href="{u}" target="_blank" style="
-            margin-right:8px;
-            color:{color};
-            font-weight:700;
-            text-decoration:none;
-        ">
-            Open image {i+2}
-        </a>
-        '''
-        for i, u in enumerate(urls[1:])
-    ])
+    slides = []
 
-    return f"""
-    <div style="margin-top:10px; text-align:center;">
+    n = len(urls)
 
-        <a href="{first}" target="_blank">
-            <img src="{first}" style="
-                width:300px;
-                max-width:100%;
-                border-radius:12px;
-                border:3px solid {color};
-            ">
-        </a>
+    for i, url in enumerate(urls):
 
-        <div style="margin-top:10px;">
-            <a href="{first}" target="_blank" style="
-                color:{color};
-                font-weight:800;
-                text-decoration:none;
-                margin-right:10px;
-            ">
-                Open image 1
+        prev_i = (i - 1) % n
+        next_i = (i + 1) % n
+
+        slide_id = f"tree-slider-{uid}-{i}"
+
+        slide = f"""
+        <div
+            id="{slide_id}"
+            style="
+                min-width:100%;
+                width:100%;
+                flex:0 0 100%;
+                scroll-snap-align:start;
+                position:relative;
+                box-sizing:border-box;
+            "
+        >
+
+            <a
+                href="{url}"
+                target="_blank"
+                style="display:block;"
+            >
+                <img
+                    src="{url}"
+                    style="
+                        width:100%;
+                        height:470px;
+                        object-fit:cover;
+                        display:block;
+                        border-radius:12px;
+                        border:3px solid {color};
+                        box-sizing:border-box;
+                    "
+                >
             </a>
 
-            {extra_links}
+            <div
+                style="
+                    position:absolute;
+                    top:12px;
+                    right:12px;
+                    background:rgba(0,0,0,0.65);
+                    color:white;
+                    border-radius:14px;
+                    padding:4px 9px;
+                    font-size:12px;
+                    font-weight:700;
+                "
+            >
+                {i + 1} / {n}
+            </div>
+
+            <a
+                href="#tree-slider-{uid}-{prev_i}"
+                style="
+                    position:absolute;
+                    left:10px;
+                    top:50%;
+                    transform:translateY(-50%);
+                    width:34px;
+                    height:34px;
+                    line-height:31px;
+                    border-radius:50%;
+                    background:rgba(0,0,0,0.55);
+                    color:white;
+                    font-size:25px;
+                    font-weight:bold;
+                    text-decoration:none;
+                    text-align:center;
+                "
+            >
+                &#8249;
+            </a>
+
+            <a
+                href="#tree-slider-{uid}-{next_i}"
+                style="
+                    position:absolute;
+                    right:10px;
+                    top:50%;
+                    transform:translateY(-50%);
+                    width:34px;
+                    height:34px;
+                    line-height:31px;
+                    border-radius:50%;
+                    background:rgba(0,0,0,0.55);
+                    color:white;
+                    font-size:25px;
+                    font-weight:bold;
+                    text-decoration:none;
+                    text-align:center;
+                "
+            >
+                &#8250;
+            </a>
+
+        </div>
+        """
+
+        slides.append(slide)
+
+    return f"""
+    <div
+        style="
+            margin-top:12px;
+            width:100%;
+        "
+    >
+
+        <div
+            style="
+                width:100%;
+                display:flex;
+                overflow-x:auto;
+                scroll-snap-type:x mandatory;
+                scroll-behavior:smooth;
+                border-radius:12px;
+            "
+        >
+            {''.join(slides)}
+        </div>
+
+        <div
+            style="
+                text-align:center;
+                margin-top:6px;
+                font-size:12px;
+                color:#666;
+            "
+        >
+            Scroll / swipe to view images
         </div>
 
     </div>
     """
-
 
 def make_popup_html(row, colormap):
     c_seq = row["CARBON_SEQUESTERED_KG_YR"]
@@ -483,8 +676,21 @@ def build_map(df: pd.DataFrame, out_html: Path):
     m = folium.Map(
         location=[55.8642, -4.2518],
         zoom_start=11,
-        tiles="CartoDB positron",
+        tiles="OpenStreetMap",
     )
+
+    # Make only the basemap grayscale
+    gray_map_css = """
+    <style>
+    .leaflet-tile-pane {
+        filter: grayscale(100%) brightness(105%) contrast(90%);
+    }
+    </style>
+    """
+
+    m.get_root().header.add_child(
+        Element(gray_map_css)
+)
 
     vmin = float(df_map["CARBON_SEQUESTERED_KG_YR"].min())
     vmax = float(df_map["CARBON_SEQUESTERED_KG_YR"].max())

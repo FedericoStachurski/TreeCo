@@ -164,18 +164,156 @@ def carbon_stock_uncertainty(height_m, height_unc_m, diameter_cm, diameter_unc_c
 
 
 def load_table(path):
-    path = Path(path)
+    import csv
 
-    if path.suffix.lower() in [".xlsx", ".xls"]:
+    path = Path(path).expanduser()
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"File not found: {path}"
+        )
+
+    suffix = path.suffix.lower()
+
+    # =====================================================
+    # Excel
+    # =====================================================
+    if suffix in {".xlsx", ".xls"}:
+        print(f"[DATA] Reading Excel: {path}")
         return pd.read_excel(path)
 
-    if path.suffix.lower() == ".csv":
-        try:
-            return pd.read_csv(path)
-        except Exception:
-            return pd.read_csv(path, sep=";")
+    # =====================================================
+    # CommuniMap CSV
+    # =====================================================
+    if suffix == ".csv":
 
-    raise ValueError(f"Unsupported file type: {path}")
+        print(f"[DATA] Reading CommuniMap CSV: {path}")
+
+        with path.open(
+            "r",
+            encoding="utf-8-sig",
+            errors="replace",
+            newline="",
+        ) as f:
+
+            reader = csv.reader(
+                f,
+                delimiter=";",
+                quotechar='"',
+            )
+
+            header = next(reader)
+            rows = list(reader)
+
+        original_ncols = len(header)
+
+        max_ncols = max(
+            [len(header)]
+            + [len(row) for row in rows]
+        )
+
+        print(
+            f"[DATA] Header columns: "
+            f"{original_ncols}"
+        )
+
+        print(
+            f"[DATA] Maximum row columns: "
+            f"{max_ncols}"
+        )
+
+        # -------------------------------------------------
+        # Handle extra MEDIA columns
+        # -------------------------------------------------
+        if max_ncols > len(header):
+
+            extra = (
+                max_ncols
+                - len(header)
+            )
+
+            print(
+                f"[DATA] Found {extra} "
+                f"additional media column(s)."
+            )
+
+            media_indices = []
+
+            for col in header:
+
+                col_str = str(col)
+
+                if col_str.startswith(
+                    "MEDIA_2635_"
+                ):
+
+                    try:
+                        media_indices.append(
+                            int(
+                                col_str.split("_")[-1]
+                            )
+                        )
+
+                    except ValueError:
+                        pass
+
+            next_media_idx = (
+                max(media_indices) + 1
+                if media_indices
+                else 0
+            )
+
+            for i in range(extra):
+
+                new_col = (
+                    f"MEDIA_2635_"
+                    f"{next_media_idx + i}"
+                )
+
+                print(
+                    f"[DATA] Adding column: "
+                    f"{new_col}"
+                )
+
+                header.append(new_col)
+
+        # -------------------------------------------------
+        # Pad shorter rows
+        # -------------------------------------------------
+        padded_rows = []
+
+        for row in rows:
+
+            if len(row) < len(header):
+
+                row = (
+                    row
+                    + [""] * (
+                        len(header)
+                        - len(row)
+                    )
+                )
+
+            padded_rows.append(
+                row[:len(header)]
+            )
+
+        df = pd.DataFrame(
+            padded_rows,
+            columns=header,
+        )
+
+        print(
+            f"[DATA] Loaded CommuniMap CSV: "
+            f"{len(df)} rows × "
+            f"{len(df.columns)} columns"
+        )
+
+        return df
+
+    raise ValueError(
+        f"Unsupported file type: {path}"
+    )
 
 
 def list_images_for_group(group):
@@ -342,41 +480,175 @@ def build_raw_carbon_table(input_path):
 # =========================================================
 
 def make_image_scroller(image_urls, color):
-    if not isinstance(image_urls, list) or len(image_urls) == 0:
+    import re
+    import hashlib
+
+    if image_urls is None:
         return ""
 
-    valid_urls = [
-        u for u in image_urls
-        if isinstance(u, str) and u.startswith("http")
+    if isinstance(image_urls, list):
+        urls = image_urls
+    else:
+        urls = re.findall(
+            r'https?://[^\s,"\']+',
+            str(image_urls),
+        )
+
+    urls = [
+        u.strip()
+        for u in urls
+        if str(u).startswith("http")
     ]
 
-    if not valid_urls:
+    if not urls:
         return ""
 
-    imgs = "\n".join([
-        f"""
-        <div style="display:inline-block; margin-right:8px;">
-            <img src="{url}" style="
-                height:220px;
-                max-width:300px;
-                border-radius:12px;
-                border:3px solid {color};
-                object-fit:cover;
-            ">
+    # Unique ID so sliders from different tree popups
+    # do not interfere with each other.
+    uid = hashlib.md5(
+        "|".join(urls).encode("utf-8")
+    ).hexdigest()[:10]
+
+    slides = []
+
+    n = len(urls)
+
+    for i, url in enumerate(urls):
+
+        prev_i = (i - 1) % n
+        next_i = (i + 1) % n
+
+        slide_id = f"tree-slider-{uid}-{i}"
+
+        slide = f"""
+        <div
+            id="{slide_id}"
+            style="
+                min-width:100%;
+                width:100%;
+                flex:0 0 100%;
+                scroll-snap-align:start;
+                position:relative;
+                box-sizing:border-box;
+            "
+        >
+
+            <a
+                href="{url}"
+                target="_blank"
+                style="display:block;"
+            >
+                <img
+                    src="{url}"
+                    style="
+                        width:100%;
+                        height:470px;
+                        object-fit:cover;
+                        display:block;
+                        border-radius:12px;
+                        border:3px solid {color};
+                        box-sizing:border-box;
+                    "
+                >
+            </a>
+
+            <div
+                style="
+                    position:absolute;
+                    top:12px;
+                    right:12px;
+                    background:rgba(0,0,0,0.65);
+                    color:white;
+                    border-radius:14px;
+                    padding:4px 9px;
+                    font-size:12px;
+                    font-weight:700;
+                "
+            >
+                {i + 1} / {n}
+            </div>
+
+            <a
+                href="#tree-slider-{uid}-{prev_i}"
+                style="
+                    position:absolute;
+                    left:10px;
+                    top:50%;
+                    transform:translateY(-50%);
+                    width:34px;
+                    height:34px;
+                    line-height:31px;
+                    border-radius:50%;
+                    background:rgba(0,0,0,0.55);
+                    color:white;
+                    font-size:25px;
+                    font-weight:bold;
+                    text-decoration:none;
+                    text-align:center;
+                "
+            >
+                &#8249;
+            </a>
+
+            <a
+                href="#tree-slider-{uid}-{next_i}"
+                style="
+                    position:absolute;
+                    right:10px;
+                    top:50%;
+                    transform:translateY(-50%);
+                    width:34px;
+                    height:34px;
+                    line-height:31px;
+                    border-radius:50%;
+                    background:rgba(0,0,0,0.55);
+                    color:white;
+                    font-size:25px;
+                    font-weight:bold;
+                    text-decoration:none;
+                    text-align:center;
+                "
+            >
+                &#8250;
+            </a>
+
         </div>
         """
-        for url in valid_urls
-    ])
+
+        slides.append(slide)
 
     return f"""
-    <div style="
-        margin-top:10px;
-        overflow-x:auto;
-        white-space:nowrap;
-        width:335px;
-        padding-bottom:8px;
-    ">
-        {imgs}
+    <div
+        style="
+            margin-top:12px;
+            width:100%;
+        "
+    >
+
+        <div
+            style="
+                width:100%;
+                display:flex;
+                overflow-x:auto;
+                scroll-snap-type:x mandatory;
+                scroll-behavior:smooth;
+                border-radius:12px;
+            "
+        >
+            {''.join(slides)}
+        </div>
+
+        <div
+            style="
+                text-align:center;
+                margin-top:6px;
+                font-size:12px;
+                color:#666;
+            "
+        >
+            Scroll / swipe to view images
+        </div>
+
     </div>
     """
 
@@ -447,10 +719,23 @@ def build_map(df, out_html):
         return
 
     m = folium.Map(
-        location=[55.8642, -4.2518],
-        zoom_start=11,
-        tiles="CartoDB positron",
-    )
+            location=[55.8642, -4.2518],
+            zoom_start=11,
+            tiles="OpenStreetMap",
+        )
+    
+    # Make only the basemap grayscale
+    gray_map_css = """
+    <style>
+    .leaflet-tile-pane {
+        filter: grayscale(100%) brightness(105%) contrast(90%);
+    }
+    </style>
+    """
+
+    m.get_root().header.add_child(
+        Element(gray_map_css)
+)
 
     vmin = float(df_map["CARBON_SEQUESTERED_KG_YR"].min())
     vmax = float(df_map["CARBON_SEQUESTERED_KG_YR"].max())
