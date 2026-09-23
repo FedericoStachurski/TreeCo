@@ -19,6 +19,15 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 import torchvision.transforms.functional as TF
 
+from treeco.training.training_DBH_species_encoder import (
+    TreeCoMultimodalResNetEncoder,
+    ResNetDBH,
+    ResNetDBHWithSpecies,
+    build_standard_resnet_encoder,
+)
+
+
+
 
 # =========================================================
 # Constants / labels
@@ -178,121 +187,7 @@ def apply_species_mapping(df: pd.DataFrame, species_to_idx: dict[str, int]) -> p
 # =========================================================
 # Model definitions: match training script exactly
 # =========================================================
-def build_resnet_encoder(
-    backbone: str,
-    in_channels: int,
-    device: torch.device,
-) -> tuple[nn.Module, int]:
-    """
-    Same structure as training build_resnet_encoder, but uses weights=None
-    because all learned weights are loaded from the checkpoint.
-    """
-    backbone = str(backbone).lower()
 
-    if backbone == "resnet18":
-        model = models.resnet18(weights=None)
-    elif backbone == "resnet34":
-        model = models.resnet34(weights=None)
-    elif backbone == "resnet50":
-        model = models.resnet50(weights=None)
-    elif backbone == "resnet101":
-        model = models.resnet101(weights=None)
-    else:
-        raise ValueError(f"Unsupported backbone: {backbone}")
-
-    if in_channels != 3:
-        old_conv = model.conv1
-        model.conv1 = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            padding=old_conv.padding,
-            bias=False,
-        )
-
-    image_feat_dim = model.fc.in_features
-    model.fc = nn.Identity()
-
-    return model.to(device), image_feat_dim
-
-
-class ResNetDBHWithSpecies(nn.Module):
-    def __init__(
-        self,
-        image_encoder: nn.Module,
-        image_feat_dim: int,
-        num_species: int,
-        species_emb_dim: int = 16,
-        dropout_rate: float = 0.1,
-    ):
-        super().__init__()
-
-        self.image_encoder = image_encoder
-
-        self.species_embedding = nn.Embedding(
-            num_embeddings=num_species,
-            embedding_dim=species_emb_dim,
-        )
-
-        self.head = nn.Sequential(
-            nn.Dropout(p=dropout_rate),
-            nn.Linear(image_feat_dim + species_emb_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(p=dropout_rate),
-            nn.Linear(128, 1),
-        )
-
-    def forward(self, x: torch.Tensor, species_idx: torch.Tensor) -> torch.Tensor:
-        image_feat = self.image_encoder(x)
-        species_feat = self.species_embedding(species_idx)
-        fused = torch.cat([image_feat, species_feat], dim=1)
-        return self.head(fused)
-
-
-def build_resnet(
-    backbone: str,
-    in_channels: int,
-    device: torch.device,
-    dropout_rate: float = 0.1,
-) -> nn.Module:
-    image_encoder, image_feat_dim = build_resnet_encoder(
-        backbone=backbone,
-        in_channels=in_channels,
-        device=device,
-    )
-
-    image_encoder.fc = nn.Sequential(
-        nn.Dropout(p=dropout_rate),
-        nn.Linear(image_feat_dim, 1),
-    )
-
-    return image_encoder.to(device)
-
-
-def build_resnet_with_species(
-    backbone: str,
-    in_channels: int,
-    device: torch.device,
-    num_species: int,
-    species_emb_dim: int = 16,
-    dropout_rate: float = 0.1,
-) -> nn.Module:
-    image_encoder, image_feat_dim = build_resnet_encoder(
-        backbone=backbone,
-        in_channels=in_channels,
-        device=device,
-    )
-
-    model = ResNetDBHWithSpecies(
-        image_encoder=image_encoder,
-        image_feat_dim=image_feat_dim,
-        num_species=num_species,
-        species_emb_dim=species_emb_dim,
-        dropout_rate=dropout_rate,
-    )
-
-    return model.to(device)
 
 
 def _strip_module_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -307,80 +202,260 @@ def load_model_run(run_path: Path, device: torch.device):
 
     if not config_path.exists():
         raise FileNotFoundError(f"Missing config.json: {config_path}")
+
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Missing best_model.pth: {checkpoint_path}")
 
+    # ---------------------------------------------------------
+    # Load config + checkpoint
+    # ---------------------------------------------------------
     config = load_json(config_path, required=True)
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+    )
+
+    state_dict = checkpoint.get(
+        "model_state_dict",
+        checkpoint,
+    )
+
     state_dict = _strip_module_prefix(state_dict)
 
+    # ---------------------------------------------------------
+    # Basic run settings
+    # ---------------------------------------------------------
+    backbone = config.get(
+        "backbone",
+        checkpoint.get("backbone", "resnet18"),
+    )
+
+    input_mode = config.get(
+        "input_mode",
+        checkpoint.get("input_mode", "rgb"),
+    )
+
+    dropout_rate = float(
+        config.get(
+            "dropout_rate",
+            checkpoint.get("dropout_rate", 0.1),
+        )
+    )
+
+    # ---------------------------------------------------------
+    # Detect species branch
+    # ---------------------------------------------------------
     is_species_model = bool(
         config.get("use_species", False)
         or checkpoint.get("use_species", False)
-        or any(k.startswith("species_embedding.") for k in state_dict.keys())
+        or any(
+            k.startswith("species_embedding.")
+            for k in state_dict.keys()
+        )
     )
 
-    backbone = config.get("backbone", checkpoint.get("backbone", "resnet18"))
-    dropout_rate = float(config.get("dropout_rate", 0.1))
-    input_mode = config.get("input_mode", checkpoint.get("input_mode", "rgb"))
+    # ---------------------------------------------------------
+    # Detect TreeCo multimodal encoder
+    #
+    # This allows old runs to work even if config.json did not
+    # explicitly contain use_encoder / encoder_type.
+    # ---------------------------------------------------------
+    encoder_type = str(
+        config.get("encoder_type", "")
+    ).lower()
 
-    # Infer in_channels from checkpoint when possible; this avoids config drift.
-    if is_species_model and "image_encoder.conv1.weight" in state_dict:
-        in_channels = int(state_dict["image_encoder.conv1.weight"].shape[1])
-    elif "conv1.weight" in state_dict:
-        in_channels = int(state_dict["conv1.weight"].shape[1])
-    else:
-        in_channels = int(config.get("in_channels", INPUT_CHANNELS.get(input_mode, 3)))
+    config_says_encoder = bool(
+        config.get("use_encoder", False)
+        or encoder_type in {
+            "treeco_multimodal",
+            "multimodal",
+            "treeco",
+        }
+    )
 
+    checkpoint_says_encoder = any(
+        (
+            k.startswith("image_encoder.rgb_encoder.")
+            or k.startswith("image_encoder.mask_encoder.")
+            or k.startswith("image_encoder.depth_encoder.")
+            or k.startswith("image_encoder.fusion_encoder.")
+        )
+        for k in state_dict.keys()
+    )
+
+    use_multimodal_encoder = (
+        config_says_encoder
+        or checkpoint_says_encoder
+    )
+
+    # ---------------------------------------------------------
+    # Species information
+    # ---------------------------------------------------------
     if is_species_model:
-        species_to_idx = load_species_mapping(run_path, config)
+
+        species_to_idx = load_species_mapping(
+            run_path,
+            config,
+        )
+
         if species_to_idx is None:
             raise FileNotFoundError(
-                "This is a species-aware checkpoint, but species_to_idx.json could not be found. "
-                f"Expected {run_path / 'species_to_idx.json'} or config['species_mapping_path']."
+                "This is a species-aware checkpoint, but "
+                "species_to_idx.json could not be found. "
+                f"Expected {run_path / 'species_to_idx.json'} "
+                "or config['species_mapping_path']."
             )
 
         if "species_embedding.weight" in state_dict:
-            num_species = int(state_dict["species_embedding.weight"].shape[0])
-            species_emb_dim = int(state_dict["species_embedding.weight"].shape[1])
-        else:
-            num_species = int(config.get("num_species", len(species_to_idx)))
-            species_emb_dim = int(config.get("species_emb_dim", 16))
 
-        print("Detected species-aware DBH model.")
-        print(f"Backbone: {backbone}")
+            num_species = int(
+                state_dict[
+                    "species_embedding.weight"
+                ].shape[0]
+            )
+
+            species_emb_dim = int(
+                state_dict[
+                    "species_embedding.weight"
+                ].shape[1]
+            )
+
+        else:
+
+            num_species = int(
+                config.get(
+                    "num_species",
+                    len(species_to_idx),
+                )
+            )
+
+            species_emb_dim = int(
+                config.get(
+                    "species_emb_dim",
+                    config.get(
+                        "species_embedding_dim",
+                        16,
+                    ),
+                )
+            )
+
+    else:
+
+        species_to_idx = None
+        num_species = None
+        species_emb_dim = None
+
+    # ---------------------------------------------------------
+    # Build IMAGE encoder
+    # ---------------------------------------------------------
+    if use_multimodal_encoder:
+
+        print("Detected TreeCo multimodal encoder.")
+        print(f"Backbone:   {backbone}")
+        print(f"Input mode: {input_mode}")
+
+        image_encoder = TreeCoMultimodalResNetEncoder(
+            backbone=backbone,
+            input_mode=input_mode,
+        ).to(device)
+
+        image_feat_dim = image_encoder.image_feat_dim
+
+    else:
+
+        # Determine number of input channels for old standard
+        # ResNet models.
+        if (
+            is_species_model
+            and "image_encoder.conv1.weight" in state_dict
+        ):
+            in_channels = int(
+                state_dict[
+                    "image_encoder.conv1.weight"
+                ].shape[1]
+            )
+
+        elif "image_encoder.conv1.weight" in state_dict:
+            in_channels = int(
+                state_dict[
+                    "image_encoder.conv1.weight"
+                ].shape[1]
+            )
+
+        elif "conv1.weight" in state_dict:
+            in_channels = int(
+                state_dict["conv1.weight"].shape[1]
+            )
+
+        else:
+            in_channels = int(
+                config.get(
+                    "in_channels",
+                    INPUT_CHANNELS.get(input_mode, 3),
+                )
+            )
+
+        print("Detected standard ResNet encoder.")
+        print(f"Backbone:       {backbone}")
+        print(f"Input mode:     {input_mode}")
         print(f"Input channels: {in_channels}")
-        print(f"Species categories: {num_species}")
+
+        image_encoder, image_feat_dim = (
+            build_standard_resnet_encoder(
+                backbone=backbone,
+                in_channels=in_channels,
+                device=device,
+            )
+        )
+
+    # ---------------------------------------------------------
+    # Build regression head
+    # ---------------------------------------------------------
+    if is_species_model:
+
+        print("Species-aware DBH model.")
+        print(f"Species categories:    {num_species}")
         print(f"Species embedding dim: {species_emb_dim}")
 
-        model = build_resnet_with_species(
-            backbone=backbone,
-            in_channels=in_channels,
-            device=device,
+        model = ResNetDBHWithSpecies(
+            image_encoder=image_encoder,
+            image_feat_dim=image_feat_dim,
             num_species=num_species,
             species_emb_dim=species_emb_dim,
             dropout_rate=dropout_rate,
         )
+
     else:
-        species_to_idx = None
 
-        print("Detected plain image-only DBH model.")
-        print(f"Backbone: {backbone}")
-        print(f"Input channels: {in_channels}")
+        print("Image-only DBH model.")
 
-        model = build_resnet(
-            backbone=backbone,
-            in_channels=in_channels,
-            device=device,
+        model = ResNetDBH(
+            image_encoder=image_encoder,
+            image_feat_dim=image_feat_dim,
             dropout_rate=dropout_rate,
         )
 
-    model.load_state_dict(state_dict, strict=True)
+    model = model.to(device)
+
+    # ---------------------------------------------------------
+    # Load trained parameters
+    # ---------------------------------------------------------
+    model.load_state_dict(
+        state_dict,
+        strict=True,
+    )
+
     model.eval()
 
-    return model, config, checkpoint_path, species_to_idx
+    print(f"Loaded checkpoint: {checkpoint_path}")
+
+    return (
+        model,
+        config,
+        checkpoint_path,
+        species_to_idx,
+    )
 
 
 # =========================================================
