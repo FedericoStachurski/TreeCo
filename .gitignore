@@ -18,6 +18,10 @@ dist/
 .ipynb_checkpoints/
 notebooks/
 
+# WandB
+sweeps/*
+wandb/*
+
 
 # =========================
 # Project data

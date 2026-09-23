@@ -52,17 +52,152 @@ from treeco.utils import groundingdino_box_cropping
 # ---------------------------------------------------------------------
 
 
-def load_table(path: str | Path) -> pd.DataFrame:
-    path = Path(path)
+from pathlib import Path
+import pandas as pd
 
-    if path.suffix.lower() in [".xlsx", ".xls"]:
+
+import csv
+from pathlib import Path
+import pandas as pd
+
+
+def load_table(path):
+    path = Path(path).expanduser()
+
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    suffix = path.suffix.lower()
+
+    # Excel
+    if suffix in [".xlsx", ".xls"]:
+        print(f"[DATA] Detected Excel file: {path}")
         return pd.read_excel(path)
 
-    if path.suffix.lower() == ".csv":
-        return pd.read_csv(path)
+    # CSV
+    if suffix == ".csv":
+        print(f"[DATA] Detected CSV file: {path}")
 
-    raise ValueError(f"Unsupported file type: {path}")
+        with open(
+            path,
+            "r",
+            encoding="utf-8-sig",
+            newline="",
+        ) as f:
 
+            reader = csv.reader(
+                f,
+                delimiter=";",
+                quotechar='"',
+            )
+
+            try:
+                header = next(reader)
+            except StopIteration:
+                raise ValueError(f"CSV file is empty: {path}")
+
+            rows = list(reader)
+
+        expected_cols = len(header)
+
+        print(f"[DATA] CSV header columns: {expected_cols}")
+
+        # Find widest row
+        max_cols = max(
+            [expected_cols] + [len(row) for row in rows]
+        )
+
+        # Some CommuniMap records contain more MEDIA fields
+        # than are declared in the header.
+        if max_cols > expected_cols:
+
+            extra_cols = max_cols - expected_cols
+
+            print(
+                f"[DATA] Found records containing up to "
+                f"{extra_cols} extra trailing media field(s)."
+            )
+
+            media_indices = []
+
+            for col in header:
+                col = str(col)
+
+                if col.startswith("MEDIA_"):
+                    try:
+                        media_indices.append(
+                            int(col.rsplit("_", 1)[1])
+                        )
+                    except (ValueError, IndexError):
+                        pass
+
+            next_media_index = (
+                max(media_indices) + 1
+                if media_indices
+                else 0
+            )
+
+            for i in range(extra_cols):
+
+                new_col = (
+                    f"MEDIA_2635_{next_media_index + i}"
+                )
+
+                header.append(new_col)
+
+                print(
+                    f"[DATA] Added inferred media column: "
+                    f"{new_col}"
+                )
+
+        target_cols = len(header)
+
+        # Normalise row widths
+        cleaned_rows = []
+        n_padded = 0
+
+        for row in rows:
+
+            if len(row) < target_cols:
+
+                row = row + [""] * (
+                    target_cols - len(row)
+                )
+
+                n_padded += 1
+
+            elif len(row) > target_cols:
+
+                raise ValueError(
+                    f"Unexpected row with {len(row)} fields "
+                    f"after expanding header to "
+                    f"{target_cols} fields."
+                )
+
+            cleaned_rows.append(row)
+
+        if n_padded:
+            print(
+                f"[DATA] Padded {n_padded} record(s) "
+                f"with missing trailing fields."
+            )
+
+        df = pd.DataFrame(
+            cleaned_rows,
+            columns=header,
+        )
+
+        print(
+            f"[DATA] Parsed CSV successfully: "
+            f"{len(df)} rows, "
+            f"{len(df.columns)} columns"
+        )
+
+        return df
+
+    raise ValueError(
+        f"Unsupported file type: {suffix}"
+    )
 
 def clean_missing(x):
     if pd.isna(x):

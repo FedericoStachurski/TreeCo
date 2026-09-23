@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import wandb
 
 import argparse
 import json
@@ -1183,6 +1184,25 @@ def main():
     )
 
     ap.add_argument(
+    "--wandb_project",
+    type=str,
+    default="treeco-dbh",
+    )
+
+    ap.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+    )
+
+    ap.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+    )
+
+    ap.add_argument(
         "--backbone",
         type=str,
         default="resnet50",
@@ -1250,6 +1270,46 @@ def main():
     ap.add_argument("--scheduler", type=str, default=None, choices=["none", "plateau", "cosine", "step"])
 
     args = ap.parse_args()
+
+    wandb_run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        mode=args.wandb_mode,
+        config=vars(args),
+        name=args.run_name,
+    )
+
+    cfg = wandb.config
+
+    sweep_params = [
+        "dataset_name",
+        "dataset_path",
+        "out_dir",
+
+        "backbone",
+        "input_mode",
+        "image_source",
+        "use_encoder",
+        "use_species",
+        "use_log1p",
+
+        "species_emb_dim",
+        "species_min_count",
+        "species_dropout",
+
+        "image_size",
+        "batch_size",
+        "dropout_rate",
+        "epochs",
+        "lr",
+        "weight_decay",
+        "criterion",
+        "scheduler",
+    ]
+
+    for name in sweep_params:
+        if name in cfg:
+            setattr(args, name, cfg[name])
 
     seed_everything(args.random_state)
 
@@ -1489,6 +1549,8 @@ def main():
             f"{encoder_tag}{species_tag}_{timestamp}"
         )
 
+    wandb_run.name = run_name
+
     run_dir = models_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1539,6 +1601,11 @@ def main():
                             "fusion_out_channels": 64,
                         } if args.use_encoder else None,
     }
+
+    wandb.config.update(
+    config,
+    allow_val_change=True,
+    )
 
     with open(config_path, "w") as f:
         json.dump(config, f, indent=4)
@@ -1641,6 +1708,24 @@ def main():
 
         history["lr"].append(float(current_lr))
 
+        wandb.log({
+        "epoch": epoch + 1,
+
+        "train/loss": train_loss,
+        "train/mae_cm": train_mae,
+        "train/rmse_cm": train_rmse,
+        "train/r2_cm": train_r2_cm,
+        "train/r2_target": train_r2_target,
+
+        "val/loss": val_loss,
+        "val/mae_cm": val_mae,
+        "val/rmse_cm": val_rmse,
+        "val/r2_cm": val_r2_cm,
+        "val/r2_target": val_r2_target,
+
+        "learning_rate": current_lr,
+        })
+
 
         print(
             f"Epoch {epoch + 1:03d}/{args.epochs} | "
@@ -1695,6 +1780,11 @@ def main():
             best_val_preds = val_preds.copy()
             best_val_targets = val_targets.copy()
 
+            wandb.run.summary["best_val_mae_cm"] = val_mae
+            wandb.run.summary["best_val_rmse_cm"] = val_rmse
+            wandb.run.summary["best_val_r2_cm"] = val_r2_cm
+            wandb.run.summary["best_epoch"] = epoch + 1
+
             torch.save(
                 checkpoint,
                 best_model_path,
@@ -1707,6 +1797,7 @@ def main():
 
     with open(history_path, "w") as f:
         json.dump(history, f, indent=4)
+
 
     metrics = {
         "best_epoch": int(best_epoch),
@@ -1746,6 +1837,7 @@ def main():
             else None
         ),
     }
+    wandb.run.summary.update(metrics)
 
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=4)
@@ -1765,13 +1857,19 @@ def main():
     pred_df["ABS_ERROR_DBH_CM"] = (pred_df["PRED_DBH_CM"] - pred_df["DBH_CM"]).abs()
     pred_df.to_csv(run_dir / "val_predictions.csv", index=False)
 
+    wandb.log({
+    "validation_predictions":
+        wandb.Table(dataframe=pred_df)
+    })
+    
+
     print("\nTraining complete.")
     print(f"Best epoch: {best_epoch}")
     print(f"Best val MAE: {best_val_mae:.2f} cm")
     print(f"Saved best model to: {best_model_path}")
     print(f"Saved last model to: {last_model_path}")
     print(f"Saved validation predictions to: {run_dir / 'val_predictions.csv'}")
-
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
