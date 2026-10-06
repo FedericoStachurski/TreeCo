@@ -216,6 +216,7 @@ class TreeDBHDataset(Dataset):
         use_species: bool = False,
         species_dropout: float = 0.0,
         species_unknown_idx: int = 0,
+        sample_weight_col: str | None = None,
     ):
         self.df = df.reset_index(drop=True)
         self.image_size = image_size
@@ -226,6 +227,7 @@ class TreeDBHDataset(Dataset):
         self.use_species = use_species
         self.species_dropout = species_dropout
         self.species_unknown_idx = species_unknown_idx
+        self.sample_weight_col = sample_weight_col
 
         if self.use_species and "TREE_SPECIES_IDX" not in self.df.columns:
             raise ValueError(
@@ -259,6 +261,14 @@ class TreeDBHDataset(Dataset):
             ratio=(0.3, 3.3),
             value="random",
         )
+        if (
+            self.sample_weight_col is not None
+            and self.sample_weight_col not in self.df.columns
+        ):
+            raise ValueError(
+                f"Sample weight column "
+                f"{self.sample_weight_col!r} is missing."
+            )
 
     def __len__(self) -> int:
         return len(self.df)
@@ -345,63 +355,169 @@ class TreeDBHDataset(Dataset):
         return TF.to_tensor(img).to(dtype=dtype)
 
     def __getitem__(self, idx: int):
+
         row = self.df.iloc[idx]
 
-        rgb = Image.open(row[self.rgb_col]).convert("RGB")
+        # =========================================================
+        # RGB
+        # =========================================================
+
+        rgb = Image.open(
+            row[self.rgb_col]
+        ).convert("RGB")
 
         single_channels = []
 
+        # =========================================================
+        # Optional image modalities
+        # =========================================================
+
         if self.use_sam:
             single_channels.append(
-                self._load_single_channel_image(row["SAM_LOGITS_PATH"])
+                self._load_single_channel_image(
+                    row["SAM_LOGITS_PATH"]
+                )
             )
 
         if self.use_sam3:
             single_channels.append(
-                self._load_single_channel_image(row["SAM3_MASK_PATH"])
+                self._load_single_channel_image(
+                    row["SAM3_MASK_PATH"]
+                )
             )
 
         if self.use_depth:
             single_channels.append(
-                self._load_single_channel_image(row["DEPTH_PATH"])
+                self._load_single_channel_image(
+                    row["DEPTH_PATH"]
+                )
             )
 
-        rgb, single_channels = self._apply_shared_geometric_transforms(
-            rgb,
-            single_channels,
+        # =========================================================
+        # Shared geometric transforms
+        # =========================================================
+
+        rgb, single_channels = (
+            self._apply_shared_geometric_transforms(
+                rgb,
+                single_channels,
+            )
         )
 
+        # =========================================================
+        # Convert to tensors
+        # =========================================================
+
         rgb_tensor = self._rgb_to_tensor(rgb)
+
         channels = [rgb_tensor]
 
         for ch in single_channels:
-            channels.append(self._single_to_tensor(ch, dtype=rgb_tensor.dtype))
+            channels.append(
+                self._single_to_tensor(
+                    ch,
+                    dtype=rgb_tensor.dtype,
+                )
+            )
 
-        x = torch.cat(channels, dim=0)
+        x = torch.cat(
+            channels,
+            dim=0,
+        )
 
-        dbh_cm = float(row["DBH_CM"])
+        # =========================================================
+        # DBH target
+        # =========================================================
+
+        dbh_cm = float(
+            row["DBH_CM"]
+        )
 
         if self.use_log1p:
             target = np.log1p(dbh_cm)
         else:
             target = dbh_cm
 
-        y = torch.tensor(target, dtype=torch.float32)
+        y = torch.tensor(
+            target,
+            dtype=torch.float32,
+        )
+
+        # =========================================================
+        # Optional training-loss weight
+        # =========================================================
+
+        sample_weight = None
+
+        if self.sample_weight_col is not None:
+
+            sample_weight = torch.tensor(
+                float(
+                    row[self.sample_weight_col]
+                ),
+                dtype=torch.float32,
+            )
+
+        # =========================================================
+        # Optional species metadata
+        # =========================================================
 
         if self.use_species:
-            species_idx = int(row["TREE_SPECIES_IDX"])
 
-            # During training, occasionally mask species to Unknown so the model
-            # does not become too dependent on the metadata.
-            if self.train and self.species_dropout > 0:
+            species_idx = int(
+                row["TREE_SPECIES_IDX"]
+            )
+
+            # During training, occasionally replace species
+            # with Unknown so that the model does not become
+            # too dependent on species metadata.
+            if (
+                self.train
+                and self.species_dropout > 0
+            ):
                 if random.random() < self.species_dropout:
-                    species_idx = self.species_unknown_idx
+                    species_idx = (
+                        self.species_unknown_idx
+                    )
 
-            species_idx = torch.tensor(species_idx, dtype=torch.long)
+            species_idx = torch.tensor(
+                species_idx,
+                dtype=torch.long,
+            )
 
-            return x, species_idx, y
+            # Species + training-loss weighting
+            if sample_weight is not None:
+                return (
+                    x,
+                    species_idx,
+                    y,
+                    sample_weight,
+                )
 
-        return x, y
+            # Species only
+            return (
+                x,
+                species_idx,
+                y,
+            )
+
+        # =========================================================
+        # No species metadata
+        # =========================================================
+
+        # Training-loss weighting only
+        if sample_weight is not None:
+            return (
+                x,
+                y,
+                sample_weight,
+            )
+
+        # Original behaviour
+        return (
+            x,
+            y,
+        )
 
 class TreeCoMultimodalResNetEncoder(nn.Module):
     """
@@ -920,54 +1036,201 @@ def run_epoch(
     device: torch.device,
     optimizer=None,
     use_log1p: bool = False,
+    use_species: bool = False,
+    use_sample_weights: bool = False,
 ):
     train_mode = optimizer is not None
-    model.train() if train_mode else model.eval()
 
-    total_loss = 0.0
+    if train_mode:
+        model.train()
+    else:
+        model.eval()
+
     all_preds_raw = []
     all_targets_raw = []
 
-    for batch in loader:
-        if len(batch) == 3:
-            x, species_idx, y = batch
-            species_idx = species_idx.to(device, non_blocking=True)
-        else:
-            x, y = batch
-            species_idx = None
+    total_loss_numerator = 0.0
+    total_loss_denominator = 0.0
 
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+    for batch in loader:
+
+        sample_weight = None
+        species_idx = None
+
+        # =====================================================
+        # Unpack batch
+        # =====================================================
+
+        if use_species and use_sample_weights:
+
+            x, species_idx, y, sample_weight = batch
+
+        elif use_species:
+
+            x, species_idx, y = batch
+
+        elif use_sample_weights:
+
+            x, y, sample_weight = batch
+
+        else:
+
+            x, y = batch
+
+        # =====================================================
+        # Move to device
+        # =====================================================
+
+        x = x.to(
+            device,
+            non_blocking=True,
+        )
+
+        y = y.to(
+            device,
+            non_blocking=True,
+        )
+
+        if species_idx is not None:
+            species_idx = species_idx.to(
+                device,
+                non_blocking=True,
+            )
+
+        if sample_weight is not None:
+            sample_weight = sample_weight.to(
+                device,
+                non_blocking=True,
+            )
+
+        # =====================================================
+        # Zero gradients only during training
+        # =====================================================
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
 
+        # =====================================================
+        # Forward + loss
+        # =====================================================
+
         with torch.set_grad_enabled(train_mode):
+
             if species_idx is None:
                 preds = model(x).squeeze(1)
             else:
-                preds = model(x, species_idx).squeeze(1)
+                preds = model(
+                    x,
+                    species_idx,
+                ).squeeze(1)
 
-            # Loss is computed in the target space:
-            # raw DBH if use_log1p=False, log1p(DBH) if use_log1p=True.
-            loss = criterion(preds, y)
+            # criterion uses reduction="none"
+            per_sample_loss = criterion(
+                preds,
+                y,
+            )
+
+            if per_sample_loss.ndim > 1:
+                per_sample_loss = (
+                    per_sample_loss
+                    .view(per_sample_loss.size(0), -1)
+                    .mean(dim=1)
+                )
+
+            # =================================================
+            # Optional training-loss weighting
+            # =================================================
+
+            if sample_weight is not None:
+
+                sample_weight = sample_weight.to(
+                    dtype=per_sample_loss.dtype,
+                )
+
+                weighted_sum = (
+                    per_sample_loss
+                    * sample_weight
+                ).sum()
+
+                weight_sum = (
+                    sample_weight
+                    .sum()
+                    .clamp_min(1e-8)
+                )
+
+                loss = (
+                    weighted_sum
+                    / weight_sum
+                )
+
+                total_loss_numerator += (
+                    weighted_sum
+                    .detach()
+                    .item()
+                )
+
+                total_loss_denominator += (
+                    weight_sum
+                    .detach()
+                    .item()
+                )
+
+            else:
+
+                loss = per_sample_loss.mean()
+
+                total_loss_numerator += (
+                    per_sample_loss
+                    .detach()
+                    .sum()
+                    .item()
+                )
+
+                total_loss_denominator += (
+                    per_sample_loss.numel()
+                )
+
+            # =================================================
+            # Optimisation
+            # =================================================
 
             if train_mode:
                 loss.backward()
                 optimizer.step()
 
-        total_loss += loss.item() * x.size(0)
-        all_preds_raw.extend(preds.detach().cpu().numpy())
-        all_targets_raw.extend(y.detach().cpu().numpy())
+        # =====================================================
+        # Save predictions for ordinary metrics
+        # =====================================================
 
-    all_preds_raw = np.array(all_preds_raw, dtype=np.float32)
-    all_targets_raw = np.array(all_targets_raw, dtype=np.float32)
+        all_preds_raw.extend(
+            preds.detach().cpu().numpy()
+        )
 
-    avg_loss = total_loss / max(len(all_targets_raw), 1)
-
+        all_targets_raw.extend(
+            y.detach().cpu().numpy()
+        )
 
     # =========================================================
-    # R2 in training / target space
+    # Epoch loss
+    # =========================================================
+
+    avg_loss = (
+        total_loss_numerator
+        / max(total_loss_denominator, 1e-8)
+    )
+
+    all_preds_raw = np.asarray(
+        all_preds_raw,
+        dtype=np.float32,
+    )
+
+    all_targets_raw = np.asarray(
+        all_targets_raw,
+        dtype=np.float32,
+    )
+
+    # =========================================================
+    # R2 in target space
     # =========================================================
 
     try:
@@ -978,28 +1241,39 @@ def run_epoch(
     except Exception:
         r2_target = np.nan
 
-
     # =========================================================
-    # Convert predictions back to real DBH cm
+    # Convert back to DBH cm
     # =========================================================
 
     if use_log1p:
 
-        all_preds = np.expm1(all_preds_raw)
-        all_targets = np.expm1(all_targets_raw)
+        all_preds = np.expm1(
+            all_preds_raw
+        )
 
-        # Prevent negative DBH predictions
-        all_preds = np.clip(all_preds, 0, None)
-        all_targets = np.clip(all_targets, 0, None)
+        all_targets = np.expm1(
+            all_targets_raw
+        )
+
+        all_preds = np.clip(
+            all_preds,
+            0,
+            None,
+        )
+
+        all_targets = np.clip(
+            all_targets,
+            0,
+            None,
+        )
 
     else:
 
         all_preds = all_preds_raw
         all_targets = all_targets_raw
 
-
     # =========================================================
-    # Metrics in real DBH cm
+    # Ordinary unweighted metrics in DBH cm
     # =========================================================
 
     mae = mean_absolute_error(
@@ -1019,7 +1293,6 @@ def run_epoch(
         )
     except Exception:
         r2_cm = np.nan
-
 
     return (
         avg_loss,
@@ -1164,6 +1437,317 @@ def make_regression_stratification_bins(tree_df: pd.DataFrame) -> pd.Series | No
         return None
 
 
+
+def parse_dbh_weight_bins(spec: str) -> np.ndarray:
+    """
+    Parse comma-separated DBH bin edges.
+
+    Example:
+        "0,20,40,60,80,100,inf"
+    """
+    parts = [p.strip().lower() for p in str(spec).split(",") if p.strip()]
+
+    if len(parts) < 2:
+        raise ValueError("--dbh_weight_bins must contain at least two edges.")
+
+    edges = []
+    for part in parts:
+        if part in {"inf", "+inf", "infinity", "+infinity"}:
+            edges.append(np.inf)
+        elif part in {"-inf", "-infinity"}:
+            edges.append(-np.inf)
+        else:
+            edges.append(float(part))
+
+    edges = np.asarray(edges, dtype=float)
+
+    if not np.all(np.diff(edges) > 0):
+        raise ValueError(
+            "--dbh_weight_bins must be strictly increasing, "
+            f"got {edges.tolist()}"
+        )
+
+    return edges
+
+
+def add_dbh_training_weights(
+    df: pd.DataFrame,
+    bin_edges: np.ndarray,
+    power: float = 0.5,
+    max_weight: float = 3.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Add a DBH-frequency weight using UNIQUE TRAINING TREES, not images.
+
+    For DBH bin b:
+
+        raw_weight_b = (max_bin_count / bin_count_b) ** power
+
+    With power=0.5 this is square-root inverse-frequency weighting.
+    Weights are clipped to max_weight.
+
+    Returns
+    -------
+    weighted_df:
+        Original image-level dataframe with DBH_BIN,
+        N_IMAGES_PER_TREE and DBH_TRAIN_WEIGHT.
+
+    summary:
+        One row per occupied DBH bin with counts and weights.
+    """
+    if power < 0:
+        raise ValueError("dbh_weight_power must be >= 0.")
+
+    if max_weight <= 0:
+        raise ValueError("dbh_weight_max must be > 0.")
+
+    out = df.copy()
+
+    # One row per independent tree.
+    tree_info = (
+        out.groupby("ID", as_index=False)
+        .agg(
+            DBH_CM=("DBH_CM", "median"),
+            N_IMAGES_PER_TREE=("ID", "size"),
+        )
+    )
+
+    tree_info["DBH_BIN"] = pd.cut(
+        tree_info["DBH_CM"],
+        bins=bin_edges,
+        right=False,
+        include_lowest=True,
+    )
+
+    if tree_info["DBH_BIN"].isna().any():
+        bad = tree_info.loc[
+            tree_info["DBH_BIN"].isna(),
+            ["ID", "DBH_CM"],
+        ]
+        raise ValueError(
+            "Some training-tree DBH values fall outside --dbh_weight_bins. "
+            f"Examples:\n{bad.head()}"
+        )
+
+    counts = (
+        tree_info.groupby("DBH_BIN", observed=True)
+        .size()
+        .rename("N_TREES")
+    )
+
+    max_count = float(counts.max())
+
+    weights = (
+        (max_count / counts.astype(float)) ** float(power)
+    ).clip(upper=float(max_weight))
+
+    weights.name = "DBH_TRAIN_WEIGHT"
+
+    summary = pd.concat(
+        [counts, weights],
+        axis=1,
+    ).reset_index()
+
+    tree_info = tree_info.merge(
+        summary[["DBH_BIN", "DBH_TRAIN_WEIGHT"]],
+        on="DBH_BIN",
+        how="left",
+        validate="many_to_one",
+    )
+
+    # Make the bin label easy to save/debug later.
+    tree_info["DBH_BIN"] = tree_info["DBH_BIN"].astype(str)
+
+    out = out.merge(
+        tree_info[
+            [
+                "ID",
+                "DBH_BIN",
+                "N_IMAGES_PER_TREE",
+                "DBH_TRAIN_WEIGHT",
+            ]
+        ],
+        on="ID",
+        how="left",
+        validate="many_to_one",
+    )
+
+    out["DBH_TRAIN_WEIGHT"] = pd.to_numeric(
+        out["DBH_TRAIN_WEIGHT"],
+        errors="raise",
+    ).astype(np.float32)
+
+    return out, summary
+
+
+def add_tree_balance_weights(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add 1 / number-of-images-for-tree.
+
+    This stops trees with many photographs from automatically contributing
+    proportionally more total loss than trees with only one photograph.
+    """
+    out = df.copy()
+
+    if "N_IMAGES_PER_TREE" not in out.columns:
+        counts = out.groupby("ID")["ID"].transform("size")
+        out["N_IMAGES_PER_TREE"] = counts.astype(int)
+
+    out["TREE_BALANCE_WEIGHT"] = (
+        1.0
+        / out["N_IMAGES_PER_TREE"].astype(float)
+    ).astype(np.float32)
+
+    return out
+
+
+def combine_training_weights(
+    df: pd.DataFrame,
+    use_dbh_weights: bool,
+    use_tree_balance: bool,
+    final_weight_max: float | None = None,
+) -> pd.DataFrame:
+    """
+    Combine enabled loss-weight components multiplicatively:
+
+        FINAL = DBH_WEIGHT * SAM3_WEIGHT * TREE_BALANCE_WEIGHT
+
+    Disabled components contribute 1.0.
+
+    The final image weights are normalised to mean 1 so the overall loss
+    scale stays comparable across experiments.
+    """
+    out = df.copy()
+
+    final_weight = np.ones(len(out), dtype=np.float64)
+
+    if use_dbh_weights:
+        if "DBH_TRAIN_WEIGHT" not in out.columns:
+            raise ValueError("DBH weighting enabled but DBH_TRAIN_WEIGHT is missing.")
+        final_weight *= out["DBH_TRAIN_WEIGHT"].to_numpy(dtype=np.float64)
+
+    if use_tree_balance:
+        if "TREE_BALANCE_WEIGHT" not in out.columns:
+            raise ValueError(
+                "Tree balancing enabled but TREE_BALANCE_WEIGHT is missing."
+            )
+        final_weight *= out["TREE_BALANCE_WEIGHT"].to_numpy(dtype=np.float64)
+
+    if not np.all(np.isfinite(final_weight)) or np.any(final_weight <= 0):
+        raise ValueError("Final training weights must all be finite and > 0.")
+
+    # Keep average loss scale similar to the unweighted experiment.
+    final_weight /= final_weight.mean()
+
+    # Optional strict safety cap for very rare DBH + one-image combinations.
+    # We do not renormalise after clipping; run_epoch divides by sum(weights),
+    # so an overall multiplicative scale does not change the weighted loss.
+    if final_weight_max is not None:
+        final_weight_max = float(final_weight_max)
+        if final_weight_max <= 0:
+            raise ValueError("--final_weight_max must be > 0.")
+        final_weight = np.minimum(final_weight, final_weight_max)
+
+    out["TRAIN_WEIGHT"] = final_weight.astype(np.float32)
+
+    return out
+
+
+def print_training_weight_diagnostics(
+    df: pd.DataFrame,
+    use_dbh_weights: bool,
+    use_tree_balance: bool,
+) -> None:
+    print("\n" + "=" * 60)
+    print("TRAINING WEIGHT DIAGNOSTICS")
+    print("=" * 60)
+
+    print(f"DBH weighting:       {use_dbh_weights}")
+    print(f"Tree balancing:      {use_tree_balance}")
+
+    for col in [
+        "DBH_TRAIN_WEIGHT",
+        "TREE_BALANCE_WEIGHT",
+        "TRAIN_WEIGHT",
+    ]:
+        if col in df.columns:
+            print(f"\n{col}")
+            print(df[col].describe())
+
+    if "TRAIN_WEIGHT" in df.columns:
+        tree_totals = (
+            df.groupby("ID", as_index=False)
+            .agg(
+                DBH_CM=("DBH_CM", "median"),
+                N_IMAGES=("ID", "size"),
+                TOTAL_TRAIN_WEIGHT=("TRAIN_WEIGHT", "sum"),
+                MEAN_TRAIN_WEIGHT=("TRAIN_WEIGHT", "mean"),
+            )
+        )
+
+        print("\nPer-tree total training-weight summary")
+        print(tree_totals["TOTAL_TRAIN_WEIGHT"].describe())
+
+        print("\nHighest-weight training trees")
+        print(
+            tree_totals.sort_values(
+                "TOTAL_TRAIN_WEIGHT",
+                ascending=False,
+            ).head(10).to_string(index=False)
+        )
+
+
+def make_dbh_weight_bins(
+    dbh_values,
+    bin_size: float,
+) -> np.ndarray:
+    """
+    Create equal-width DBH bins starting at 0.
+
+    Example
+    -------
+    If bin_size = 20 and max DBH = 127 cm:
+
+        [0, 20, 40, 60, 80, 100, 120, 140]
+
+    The final edge is guaranteed to be above the maximum DBH.
+    """
+
+    if bin_size <= 0:
+        raise ValueError(
+            "dbh_bin_size must be > 0."
+        )
+
+    dbh_values = pd.to_numeric(
+        pd.Series(dbh_values),
+        errors="coerce",
+    ).dropna()
+
+    if len(dbh_values) == 0:
+        raise ValueError(
+            "Cannot construct DBH bins: no valid DBH values."
+        )
+
+    max_dbh = float(
+        dbh_values.max()
+    )
+
+    # Need an upper edge strictly above the largest value
+    upper = (
+        np.floor(max_dbh / bin_size)
+        + 1
+    ) * bin_size
+
+    bins = np.arange(
+        0,
+        upper + bin_size,
+        bin_size,
+        dtype=float,
+    )
+
+    return bins
+
+
 def main():
     ap = argparse.ArgumentParser()
 
@@ -1214,6 +1798,75 @@ def main():
         type=str,
         default="rgb",
         choices=["rgb", "rgb_depth", "rgb_sam", "rgb_sam_depth", "rgb_sam3", "rgb_sam3_depth"],
+    )
+
+
+    # ------------------------------------------------------------
+    # Optional training-loss weighting
+    # ------------------------------------------------------------
+    ap.add_argument(
+        "--w_dbh",
+        action="store_true",
+        help=(
+            "Enable DBH-frequency loss weighting based only on the "
+            "TRAINING trees."
+        ),
+    )
+
+    ap.add_argument(
+        "--w_sam3",
+        action="store_true",
+        help=(
+            "Enable SAM3 confidence loss weighting. Requires "
+            "--sam3_weights <config.json>."
+        ),
+    )
+
+    ap.add_argument(
+        "--w_tree_balance",
+        action="store_true",
+        help=(
+            "Multiply each image by 1/N_images_for_tree so trees with "
+            "many photographs do not dominate the loss."
+        ),
+    )
+
+    ap.add_argument(
+        "--dbh_bin_size",
+        type=float,
+        default=20.0,
+        help=(
+            "Width of DBH bins in cm used for DBH loss weighting. "
+            "For example, --dbh_bin_size 20 creates bins "
+            "0-20, 20-40, 40-60, etc."
+        ),
+    )
+
+    ap.add_argument(
+        "--dbh_weight_power",
+        type=float,
+        default=0.5,
+        help=(
+            "Inverse-frequency exponent for DBH weighting. "
+            "0.5 = square-root inverse frequency; 1.0 = full inverse frequency."
+        ),
+    )
+
+    ap.add_argument(
+        "--dbh_weight_max",
+        type=float,
+        default=3.0,
+        help="Maximum DBH-frequency weight before combining components.",
+    )
+
+    ap.add_argument(
+        "--final_weight_max",
+        type=float,
+        default=None,
+        help=(
+            "Optional cap on the final combined per-image weight after "
+            "normalisation. Example: 6.0. Default: no final cap."
+        ),
     )
 
     ap.add_argument(
@@ -1305,11 +1958,78 @@ def main():
         "weight_decay",
         "criterion",
         "scheduler",
+        "val_size",
+        "random_state",
+        "w_dbh",
+        "w_tree_balance",
+        "dbh_weight_bins",
+        "dbh_weight_power",
+        "dbh_weight_max",
+        "final_weight_max",
+        "num_workers",
     ]
 
     for name in sweep_params:
         if name in cfg:
             setattr(args, name, cfg[name])
+
+    # =========================================================
+    # Weighting configuration
+    # =========================================================
+
+    use_dbh_weights = bool(args.w_dbh)
+    use_tree_balance = bool(args.w_tree_balance)
+
+    use_sample_weights = any(
+        [
+            use_dbh_weights,
+            use_tree_balance,
+        ]
+    )
+
+    # These will be created later, AFTER train_df exists
+    dbh_weight_bin_edges = None
+    dbh_weight_summary = None
+
+
+    print("\n" + "=" * 60)
+    print("LOSS WEIGHTING SETUP")
+    print("=" * 60)
+
+    print(
+        f"DBH weighting:  "
+        f"{use_dbh_weights}"
+    )
+
+    print(
+        f"Tree balancing: "
+        f"{use_tree_balance}"
+    )
+
+    if use_dbh_weights:
+
+        print(
+            f"DBH bin size:    "
+            f"{args.dbh_bin_size:.1f} cm"
+        )
+
+        print(
+            f"DBH power:       "
+            f"{args.dbh_weight_power:.3f}"
+        )
+
+        print(
+            f"DBH max weight:  "
+            f"{args.dbh_weight_max:.3f}"
+        )
+
+
+    if args.final_weight_max is not None:
+
+        print(
+            f"Final weight cap: "
+            f"{args.final_weight_max:.3f}"
+        )
 
     seed_everything(args.random_state)
 
@@ -1371,6 +2091,95 @@ def main():
     train_df = df[df["ID"].isin(train_tree_ids)].copy().reset_index(drop=True)
     val_df = df[df["ID"].isin(val_tree_ids)].copy().reset_index(drop=True)
 
+    # =========================================================
+    # Build TRAINING loss weights AFTER the train/val split.
+    # Nothing from validation is used to estimate these weights.
+    # =========================================================
+
+    dbh_weight_summary = None
+
+
+    # ---------------------------------------------------------
+    # 1. Construct DBH bin edges from TRAINING data only
+    # ---------------------------------------------------------
+
+    if use_dbh_weights:
+
+        dbh_weight_bin_edges = make_dbh_weight_bins(
+            train_df["DBH_CM"],
+            bin_size=args.dbh_bin_size,
+        )
+
+        print("\nDBH weighting bins:")
+        print(dbh_weight_bin_edges)
+
+        print(
+            f"DBH bin size: "
+            f"{args.dbh_bin_size:.1f} cm"
+        )
+
+
+    # ---------------------------------------------------------
+    # 2. DBH-frequency weighting
+    # ---------------------------------------------------------
+
+    if use_dbh_weights:
+
+        train_df, dbh_weight_summary = (
+            add_dbh_training_weights(
+                train_df,
+                bin_edges=dbh_weight_bin_edges,
+                power=args.dbh_weight_power,
+                max_weight=args.dbh_weight_max,
+            )
+        )
+
+        print(
+            "\nDBH weighting by TRAINING-tree frequency"
+        )
+
+        print(
+            "----------------------------------------"
+        )
+
+        print(
+            dbh_weight_summary.to_string(
+                index=False
+            )
+        )
+
+
+    # ---------------------------------------------------------
+    # 3. Tree balancing
+    # ---------------------------------------------------------
+
+    if use_tree_balance:
+
+        train_df = add_tree_balance_weights(
+            train_df
+        )
+
+
+    # ---------------------------------------------------------
+    # 4. Combine enabled weighting components
+    # ---------------------------------------------------------
+
+    if use_sample_weights:
+
+        train_df = combine_training_weights(
+            train_df,
+            use_dbh_weights=use_dbh_weights,
+            use_tree_balance=use_tree_balance,
+            final_weight_max=args.final_weight_max,
+        )
+
+
+        print_training_weight_diagnostics(
+            train_df,
+            use_dbh_weights=use_dbh_weights,
+            use_tree_balance=use_tree_balance,
+        )
+
     species_to_idx = None
 
     if args.use_species:
@@ -1409,7 +2218,16 @@ def main():
         use_log1p=args.use_log1p,
         use_species=args.use_species,
         species_dropout=args.species_dropout,
-        species_unknown_idx=species_to_idx[SPECIES_UNKNOWN] if species_to_idx else 0,
+        species_unknown_idx=(
+            species_to_idx[SPECIES_UNKNOWN]
+            if species_to_idx
+            else 0
+        ),
+        sample_weight_col=(
+            "TRAIN_WEIGHT"
+            if use_sample_weights
+            else None
+        ),
     )
 
     val_ds = TreeDBHDataset(
@@ -1421,7 +2239,12 @@ def main():
         use_log1p=args.use_log1p,
         use_species=args.use_species,
         species_dropout=0.0,
-        species_unknown_idx=species_to_idx[SPECIES_UNKNOWN] if species_to_idx else 0,
+        species_unknown_idx=(
+            species_to_idx[SPECIES_UNKNOWN]
+            if species_to_idx
+            else 0
+        ),
+        sample_weight_col=None,
     )
 
     train_loader = DataLoader(
@@ -1501,9 +2324,18 @@ def main():
             )
 
     if args.criterion == "smoothl1":
-        criterion = nn.SmoothL1Loss(beta=1.0)
+
+            criterion = nn.SmoothL1Loss(
+                beta=1.0,
+                reduction="none",
+            )
+
     else:
-            criterion = nn.HuberLoss(delta=5.0)
+
+            criterion = nn.HuberLoss(
+                delta=5.0,
+                reduction="none",
+            )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1542,11 +2374,15 @@ def main():
     else:
         encoder_tag = "_encoder" if args.use_encoder else "_noEncoder"
         species_tag = "_species" if args.use_species else ""
+        dbh_weight_tag = "_wDBH" if use_dbh_weights else ""
+        tree_weight_tag = "_wTree" if use_tree_balance else ""
 
         run_name = (
             f"dbh_{args.backbone}_"
             f"{args.input_mode}_{args.image_source}"
-            f"{encoder_tag}{species_tag}_{timestamp}"
+            f"{encoder_tag}{species_tag}"
+            f"{dbh_weight_tag}{tree_weight_tag}_"
+            f"{timestamp}"
         )
 
     wandb_run.name = run_name
@@ -1564,6 +2400,33 @@ def main():
     if args.use_species:
         with open(species_mapping_path, "w") as f:
             json.dump(species_to_idx, f, indent=4)
+
+    if use_sample_weights:
+        weight_cols = [
+            c for c in [
+                "ID",
+                "IMAGE_ID",
+                "DBH_CM",
+                "DBH_BIN",
+                "N_IMAGES_PER_TREE",
+                "DBH_TRAIN_WEIGHT",
+                "SAM3_TRAIN_WEIGHT",
+                "TREE_BALANCE_WEIGHT",
+                "TRAIN_WEIGHT",
+            ]
+            if c in train_df.columns
+        ]
+
+        train_df[weight_cols].to_csv(
+            run_dir / "training_sample_weights.csv",
+            index=False,
+        )
+
+        if dbh_weight_summary is not None:
+            dbh_weight_summary.to_csv(
+                run_dir / "dbh_weight_summary.csv",
+                index=False,
+            )
 
     config = {
         "task": "dbh_regression",
@@ -1600,6 +2463,17 @@ def main():
                             "depth_out_channels": 16,
                             "fusion_out_channels": 64,
                         } if args.use_encoder else None,
+        "weighting_enabled": use_sample_weights,
+        "w_dbh": use_dbh_weights,
+        "w_tree_balance": use_tree_balance,
+        "dbh_weight_bins": dbh_weight_bin_edges.tolist(),
+        "dbh_weight_power": float(args.dbh_weight_power),
+        "dbh_weight_max": float(args.dbh_weight_max),
+        "final_weight_max": (
+            float(args.final_weight_max)
+            if args.final_weight_max is not None
+            else None
+        ),
     }
 
     wandb.config.update(
@@ -1659,6 +2533,8 @@ def main():
             device=device,
             optimizer=optimizer,
             use_log1p=args.use_log1p,
+            use_species=args.use_species,
+            use_sample_weights=use_sample_weights,
         )
 
         (
@@ -1676,6 +2552,8 @@ def main():
             device=device,
             optimizer=None,
             use_log1p=args.use_log1p,
+            use_species=args.use_species,
+            use_sample_weights=False,
         )
 
         if scheduler is not None:
@@ -1763,6 +2641,17 @@ def main():
 
             "use_log1p": args.use_log1p,
             "use_encoder": args.use_encoder,
+            "weighting_enabled": use_sample_weights,
+            "w_dbh": use_dbh_weights,
+            "w_tree_balance": use_tree_balance,
+            "dbh_weight_bins": dbh_weight_bin_edges.tolist(),
+            "dbh_weight_power": float(args.dbh_weight_power),
+            "dbh_weight_max": float(args.dbh_weight_max),
+            "final_weight_max": (
+                float(args.final_weight_max)
+                if args.final_weight_max is not None
+                else None
+            ),
         }
 
         torch.save(checkpoint, last_model_path)
@@ -1830,6 +2719,9 @@ def main():
         "use_log1p": bool(args.use_log1p),
         "use_encoder": bool(args.use_encoder),
         "use_species": bool(args.use_species),
+        "weighting_enabled": bool(use_sample_weights),
+        "w_dbh": bool(use_dbh_weights),
+        "w_tree_balance": bool(use_tree_balance),
 
         "num_species": (
             len(species_to_idx)
