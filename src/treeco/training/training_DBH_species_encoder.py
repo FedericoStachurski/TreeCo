@@ -1910,6 +1910,26 @@ def main():
         help="Use separate modality encoders before ResNet fusion.",
     )
 
+    ap.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=15,
+        help=(
+            "Stop training if validation MAE does not improve for this "
+            "many consecutive epochs. Set to 0 to disable."
+        ),
+    )
+
+    ap.add_argument(
+        "--early_stopping_min_delta",
+        type=float,
+        default=0.05,
+        help=(
+            "Minimum improvement in validation MAE [cm] required "
+            "to reset early-stopping patience."
+        ),
+    )
+
     ap.add_argument("--image_size", type=int, default=224)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--dropout_rate", type=float, default=0.1)
@@ -2466,7 +2486,7 @@ def main():
         "weighting_enabled": use_sample_weights,
         "w_dbh": use_dbh_weights,
         "w_tree_balance": use_tree_balance,
-        "dbh_weight_bins": dbh_weight_bin_edges.tolist(),
+        "dbh_weight_bins": dbh_weight_bin_edges.tolist() if dbh_weight_bin_edges is not None else None,
         "dbh_weight_power": float(args.dbh_weight_power),
         "dbh_weight_max": float(args.dbh_weight_max),
         "final_weight_max": (
@@ -2474,6 +2494,8 @@ def main():
             if args.final_weight_max is not None
             else None
         ),
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
     }
 
     wandb.config.update(
@@ -2508,6 +2530,13 @@ def main():
     best_val_rmse = np.nan
 
     best_epoch = -1
+    # =========================================================
+    # Early stopping state
+    # =========================================================
+
+    epochs_without_improvement = 0
+    early_stop_best_mae = float("inf")
+    stopped_early = False
 
     best_val_r2_cm = np.nan
     best_val_r2_target = np.nan
@@ -2644,7 +2673,7 @@ def main():
             "weighting_enabled": use_sample_weights,
             "w_dbh": use_dbh_weights,
             "w_tree_balance": use_tree_balance,
-            "dbh_weight_bins": dbh_weight_bin_edges.tolist(),
+            "dbh_weight_bins": dbh_weight_bin_edges.tolist() if dbh_weight_bin_edges is not None else None,
             "dbh_weight_power": float(args.dbh_weight_power),
             "dbh_weight_max": float(args.dbh_weight_max),
             "final_weight_max": (
@@ -2656,16 +2685,16 @@ def main():
 
         torch.save(checkpoint, last_model_path)
 
-        if val_mae < best_val_mae:
+        # =========================================================
+        # Save best model
+        # =========================================================
 
+        if val_mae < best_val_mae:
             best_val_mae = val_mae
             best_val_rmse = val_rmse
-
             best_epoch = epoch + 1
-
             best_val_r2_cm = val_r2_cm
             best_val_r2_target = val_r2_target
-
             best_val_preds = val_preds.copy()
             best_val_targets = val_targets.copy()
 
@@ -2674,10 +2703,46 @@ def main():
             wandb.run.summary["best_val_r2_cm"] = val_r2_cm
             wandb.run.summary["best_epoch"] = epoch + 1
 
-            torch.save(
-                checkpoint,
-                best_model_path,
+            torch.save(checkpoint, best_model_path)
+
+
+        # =========================================================
+        # Early stopping
+        # =========================================================
+
+        if args.early_stopping_patience > 0:
+
+            significant_improvement = (
+                val_mae < early_stop_best_mae - args.early_stopping_min_delta
             )
+
+            if significant_improvement:
+                early_stop_best_mae = val_mae
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            print(
+                f"Early stopping: {epochs_without_improvement}/"
+                f"{args.early_stopping_patience}"
+            )
+
+            if epochs_without_improvement >= args.early_stopping_patience:
+                stopped_early = True
+
+                print("\n" + "=" * 60)
+                print("EARLY STOPPING")
+                print("=" * 60)
+                print(
+                    f"No validation MAE improvement of at least "
+                    f"{args.early_stopping_min_delta:.3f} cm for "
+                    f"{args.early_stopping_patience} epochs."
+                )
+                print(f"Best epoch: {best_epoch}")
+                print(f"Best validation MAE: {best_val_mae:.2f} cm")
+                print("=" * 60 + "\n")
+
+                break
 
     if best_val_preds is not None:
         val_preds = best_val_preds
