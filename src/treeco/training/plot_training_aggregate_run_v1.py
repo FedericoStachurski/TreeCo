@@ -22,6 +22,16 @@ from sklearn.metrics import (
     r2_score,
 )
 
+from treeco.utils.conformal import (
+    build_quantile_table,
+    build_regression_conformal_scores,
+    add_regression_conformal_intervals,
+    build_classification_conformal_scores,
+    add_classification_prediction_sets,
+)
+
+from sklearn.model_selection import train_test_split
+
 
 # =========================================================
 # Plot style
@@ -1146,15 +1156,22 @@ def normalize_history(
             ),
             "train_acc": np.asarray(
                 history.get(
-                    "train_acc",
-                    [np.nan] * n,
+                    "train_accuracy",
+                    history.get(
+                        "train_acc",
+                        [np.nan] * n,
+                    ),
                 ),
                 dtype=float,
             ),
+
             "val_acc": np.asarray(
                 history.get(
-                    "val_acc",
-                    [np.nan] * n,
+                    "val_accuracy",
+                    history.get(
+                        "val_acc",
+                        [np.nan] * n,
+                    ),
                 ),
                 dtype=float,
             ),
@@ -2780,11 +2797,26 @@ def plot_classification_evaluation_diagnostics(
         )
     )
 
+    from matplotlib.colors import LinearSegmentedColormap
+
+    CONFUSION_CMAP = LinearSegmentedColormap.from_list(
+        "treeco_confusion",
+        [
+            "#F8FAFC",   # almost white
+            "#D7EEEC",   # very pale teal
+            "#94D2BD",   # mint
+            "#0A9396",   # teal
+            "#005F73",   # dark blue-teal
+        ],
+    )
+
     im = ax.imshow(
         cm_display,
-        cmap=TREECO_CMAP,
+        cmap=CONFUSION_CMAP,
         aspect="auto",
-    )
+        vmin=0,
+        vmax=1,
+)
 
     fig.colorbar(
         im,
@@ -2841,17 +2873,18 @@ def plot_classification_evaluation_diagnostics(
         "True class"
     )
 
-    ax.set_title(
-        (
-            f"{title_prefix} — "
-            f"{level_name}"
-        )
-    )
+    # ax.set_title(
+    #     (
+    #         f"{title_prefix} — "
+    #         f"{level_name}"
+    #     )
+    # )
 
     save_figure(
         fig,
         save_path,
     )
+    
 
     return metrics
 
@@ -3149,7 +3182,7 @@ def build_smooth_tree_sigma_lookup(
 ) -> pd.DataFrame:
     """
     Build a smooth prediction-dependent uncertainty relationship
-    from ALL aggregate validation trees.
+    from aggregate trees supplied in tree_df.
 
     For each aggregate predicted DBH x:
 
@@ -3625,7 +3658,9 @@ def plot_tree_aggregate_sigma_uncertainty(
     tree_df: pd.DataFrame,
     lookup_df: pd.DataFrame,
     save_path: Path,
-    METRICS: dict | None = None
+    METRICS: dict | None = None,
+    conformal_df: pd.DataFrame | None = None,
+    conformal_coverage: float = 0.90,
 ):
     """
     Plot all aggregate trees on true-vs-predicted axes with smooth
@@ -3730,7 +3765,7 @@ def plot_tree_aggregate_sigma_uncertainty(
     )
 
     # 2 sigma outer band.
-    label_2 = r"$\pm2\sigma$"
+    label_2 = r"Local $\pm2\sigma$"
 
     if np.isfinite(
         coverage[
@@ -3755,7 +3790,7 @@ def plot_tree_aggregate_sigma_uncertainty(
     )
 
     # 1 sigma inner band.
-    label_1 = r"$\pm1\sigma$"
+    label_1 = r"Local $\pm1\sigma$"
 
     if np.isfinite(
         coverage[
@@ -3798,23 +3833,20 @@ def plot_tree_aggregate_sigma_uncertainty(
         color="green",
         linestyle = "--",
         linewidth=4.6,
-        label=f"Observed best fit over validation:  {intercept:.4f} + {slope:.4f} * y_pred, ",
+        label=f"Observed best fit",
     )
 
     # Actual aggregate trees.
     ax.scatter(
         y_pred,
         y_true,
-        s=62,
-        alpha=0.78,
-        color="red",
+        s=52,
+        alpha=0.88,
+        color="#FF3B30",
         edgecolor="black",
-        linewidth=0.6,
-        label=(
-            f"Aggregate trees "
-            f"(N={len(tree_df)})"
-        ),
-        zorder=5,
+        linewidth=0.75,
+        label=f"Observed trees (N={len(tree_df)})",
+        zorder=6,
     )
     ax.scatter([],[], label = f"MAE:     "
                     f"{METRICS['mae']:.4f} cm", color = 'none')
@@ -3896,22 +3928,123 @@ def plot_tree_aggregate_sigma_uncertainty(
     ax.set_xlim(
         [
             10.0,
-            150.0,
+            100.0,
         ]
     )
 
     ax.set_ylim(
             [
                 1.0,
-                150.0,
+                120.0,
             ]
         )
     # ax.set_yscale("log")
     # ax.set_xscale("log")
+    # =====================================================
+    # Conformal prediction intervals
+    # =====================================================
+
+    if conformal_df is not None:
+
+        label = int(round(conformal_coverage * 100))
+
+        lower_col = f"lower_{label}_cm"
+        upper_col = f"upper_{label}_cm"
+
+        required = [
+            "y_pred",
+            "conformal_centre_cm",
+            lower_col,
+            upper_col,
+        ]
+
+        missing = [c for c in required if c not in conformal_df.columns]
+
+        if not missing:
+
+            conf = conformal_df[required].copy().dropna()
+
+            conf_pred = conf["y_pred"].to_numpy(dtype=float)
+            conf_centre = conf["conformal_centre_cm"].to_numpy(dtype=float)
+            conf_lower = conf[lower_col].to_numpy(dtype=float)
+            conf_upper = conf[upper_col].to_numpy(dtype=float)
+
+            lower_err = conf_centre - conf_lower
+            upper_err = conf_upper - conf_centre
+            yerr = np.vstack([lower_err, upper_err])
+
+            # Black outer silhouette
+            ax.errorbar(
+                conf_pred,
+                conf_centre,
+                yerr=yerr,
+                fmt="none",
+                ecolor="black",
+                elinewidth=1.1,
+                capsize=2.5,
+                capthick=1.4,
+                alpha=0.95,
+                zorder=3,
+            )
+
+            # Red inner interval
+            ax.errorbar(
+                conf_pred,
+                conf_centre,
+                yerr=yerr,
+                fmt="o",
+                markersize=4.5,
+                markerfacecolor=TREECO["orange"],
+                markeredgecolor="black",
+                markeredgewidth=0.8,
+                ecolor=TREECO["orange"],
+                elinewidth=1.25,
+                capsize=2.5,
+                capthick=1.4,
+                alpha=0.92,
+                label=f"{label}% conformal prediction interval",
+                zorder=4,
+            )
+
+    stats_text = (
+        f"N = {len(tree_df)}\n"
+        f"MAE = {METRICS['mae']:.2f} cm\n"
+        f"RMSE = {METRICS['rmse']:.2f} cm\n"
+        f"$R^2$ = {METRICS['r2']:.3f}\n"
+        f"Bias = {METRICS['bias']:+.2f} cm\n"
+        f"Fit: y = {intercept:.2f} + {slope:.3f}$\\hat{{y}}$\n"
+        f"$1\\sigma$ coverage = {coverage['coverage_1sigma'] * 100:.1f}%\n"
+        f"$2\\sigma$ coverage = {coverage['coverage_2sigma'] * 100:.1f}%"
+    )
+
+    ax.text(
+        0.025,
+        0.975,
+        stats_text,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9.5,
+        linespacing=1.35,
+        bbox=dict(
+            boxstyle="round,pad=0.55",
+            facecolor="white",
+            edgecolor="#94A3B8",
+            linewidth=1.0,
+            alpha=0.94,
+        ),
+        zorder=10,
+    )
 
     ax.legend(
-        loc="best",
-        fontsize=9,
+        loc="lower right",
+        fontsize=9.5,
+        frameon=True,
+        framealpha=0.96,
+        facecolor="white",
+        edgecolor="#CBD5E1",
+        borderpad=0.8,
+        labelspacing=0.55,
     )
 
     save_figure(
@@ -4025,12 +4158,12 @@ def plot_tree_sigma_vs_prediction(
         "Local empirical uncertainty [cm]"
     )
 
-    ax.set_title(
-        (
-            "TreeCo aggregate DBH uncertainty "
-            "vs predicted diameter"
-        )
-    )
+    # ax.set_title(
+    #     (
+    #         "TreeCo aggregate DBH uncertainty "
+    #         "vs predicted diameter"
+    #     )
+    # )
 
     ax.legend(
         loc="best"
@@ -4732,6 +4865,7 @@ def main():
             )
         )
 
+        
         # -------------------------------------------------
         # Image vs aggregate metrics
         # -------------------------------------------------
@@ -4763,29 +4897,37 @@ def main():
             ),
         )
 
-        # =================================================
-        # FINAL ALL-TREE SMOOTH 1σ / 2σ UNCERTAINTY
-        # =================================================
+        # =========================================================
+        # Uncertainty fit / conformal calibration split
+        # =========================================================
 
-        tree_sigma_lookup = (
-            build_smooth_tree_sigma_lookup(
-                tree_df_all,
-                bandwidth_cm=(
-                    args.sigma_bandwidth_cm
-                ),
-                n_grid=300,
-                min_effective_n=(
-                    args.sigma_min_effective_n
-                ),
-            )
+        sigma_fit_df, calibration_df = train_test_split(
+            tree_df_all,
+            test_size=0.30,
+            random_state=55,
+        )
+
+        print()
+        print("Regression conformal split")
+        print("---------------------------")
+        print(f"Sigma-fit trees:   {len(sigma_fit_df)}")
+        print(f"Calibration trees: {len(calibration_df)}")
+
+
+        # =========================================================
+        # Local prediction-dependent sigma model
+        # =========================================================
+
+        tree_sigma_lookup = build_smooth_tree_sigma_lookup(
+            sigma_fit_df,
+            bandwidth_cm=args.sigma_bandwidth_cm,
+            n_grid=300,
+            min_effective_n=args.sigma_min_effective_n,
         )
 
         sigma_lookup_csv = (
             plots_dir
-            / (
-                "tree_aggregate_ALL_"
-                "sigma_uncertainty_lookup.csv"
-            )
+            / "tree_aggregate_sigma_uncertainty_lookup.csv"
         )
 
         tree_sigma_lookup.to_csv(
@@ -4793,32 +4935,87 @@ def main():
             index=False,
         )
 
-        print(
-            f"Saved: "
-            f"{sigma_lookup_csv}"
+        print(f"Saved: {sigma_lookup_csv}")
+
+        # =========================================================
+        # Regression conformal calibration
+        # =========================================================
+
+        reg_scores = build_regression_conformal_scores(
+            calibration_df,
+            tree_sigma_lookup,
         )
+
+        reg_quantiles = build_quantile_table(
+            reg_scores["conformal_score"].to_numpy(),
+        )
+
+        reg_predictions = add_regression_conformal_intervals(
+            calibration_df,
+            tree_sigma_lookup,
+            reg_quantiles,
+        )
+
+        reg_scores.to_csv(
+            plots_dir / "conformal_regression_scores.csv",
+            index=False,
+        )
+
+        reg_quantiles.to_csv(
+            plots_dir / "conformal_regression_quantiles.csv",
+            index=False,
+        )
+
+        reg_predictions.to_csv(
+            plots_dir / "conformal_regression_calibration_predictions.csv",
+            index=False,
+        )
+
+        print()
+        print("Regression conformal calibration")
+        print("--------------------------------")
+
+        for _, row in reg_quantiles.iterrows():
+            print(
+                f"{row['coverage'] * 100:.0f}% interval: "
+                f"q = {row['q']:.4f}"
+            )
+
+
+        # Apply calibrated intervals to all aggregate trees
+        all_conformal_predictions = add_regression_conformal_intervals(
+            tree_df_all,
+            tree_sigma_lookup,
+            reg_quantiles,
+        )
+
+        all_conformal_predictions.to_csv(
+            plots_dir / "tree_aggregate_ALL_conformal_predictions.csv",
+            index=False,
+        )
+
+        # =========================================================
+        # Final sigma + conformal aggregate plot
+        # =========================================================
 
         plot_tree_aggregate_sigma_uncertainty(
             tree_df_all,
             tree_sigma_lookup,
             save_path=(
                 plots_dir
-                / (
-                    "tree_aggregate_ALL_"
-                    "true_vs_predicted_sigma.png"
-                )
+                / "tree_aggregate_ALL_true_vs_predicted_sigma.png"
             ),
-            METRICS=tree_metrics
+            METRICS=tree_metrics,
+            conformal_df=all_conformal_predictions,
+            conformal_coverage=0.90,
         )
+
 
         plot_tree_sigma_vs_prediction(
             tree_sigma_lookup,
             save_path=(
                 plots_dir
-                / (
-                    "tree_aggregate_ALL_"
-                    "sigma_vs_prediction.png"
-                )
+                / "tree_aggregate_ALL_sigma_vs_prediction.png"
             ),
         )
 
@@ -4842,9 +5039,6 @@ def main():
             "-----------------------"
         )
         print(
-            "Uses ALL aggregate validation trees."
-        )
-        print(
             "x-axis: aggregate predicted DBH."
         )
         print(
@@ -4855,6 +5049,7 @@ def main():
             "Saved 1-sigma / 2-sigma lookup for "
             "later DBH inference."
         )
+
 
     # =====================================================
     # CLASSIFICATION
@@ -4923,6 +5118,69 @@ def main():
                 )
             ),
         )
+        # =========================================================
+        # Classification conformal calibration
+        # =========================================================
+
+        mean_prob_cols = [
+            c for c in tree_df.columns
+            if c.startswith("mean_prob_")
+        ]
+
+        if mean_prob_cols:
+
+            _, calibration_df = train_test_split(
+                tree_df,
+                test_size=0.30,
+                random_state=55,
+                stratify=tree_df["y_true"],
+            )
+
+            class_scores = build_classification_conformal_scores(
+                calibration_df,
+            )
+
+            class_quantiles = build_quantile_table(
+                class_scores["conformal_score"].to_numpy(),
+            )
+
+            class_predictions = add_classification_prediction_sets(
+                calibration_df,
+                class_quantiles,
+            )
+
+
+            class_scores.to_csv(
+                plots_dir / "conformal_classification_scores.csv",
+                index=False,
+            )
+
+            class_quantiles.to_csv(
+                plots_dir / "conformal_classification_quantiles.csv",
+                index=False,
+            )
+
+            class_predictions.to_csv(
+                plots_dir / "conformal_classification_predictions.csv",
+                index=False,
+            )
+
+
+            print()
+            print("Classification conformal calibration")
+            print("------------------------------------")
+
+            for _, row in class_quantiles.iterrows():
+                print(
+                    f"{row['coverage'] * 100:.0f}% prediction set: "
+                    f"q = {row['q']:.4f}"
+                )
+
+        else:
+            print(
+                "[WARNING] No tree-level probability columns found. "
+                "Cannot perform conformal classification."
+            )        
 
     print()
     print(

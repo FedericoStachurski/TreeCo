@@ -37,6 +37,46 @@ HEIGHT_CLASS_MAP = {
 # Helpers
 # =========================================================
 
+def parse_original_height(value):
+    """
+    Interpret original CommuniMap height values.
+
+    Examples:
+        2-5       -> 3.5
+        5-10      -> 7.5
+        10-15     -> 12.5
+        12        -> 12.0
+    """
+    if pd.isna(value):
+        return np.nan
+
+    s = str(value).strip().lower()
+    s = s.replace("–", "-").replace("—", "-")
+    s = s.replace(",", ".")
+
+    # Match the original dataset's open-ended categories
+    if s == "10+ metres":
+        return 12.5
+
+    if s in HEIGHT_CLASS_MAP:
+        return HEIGHT_CLASS_MAP[s][0]
+
+    # Handle numerical ranges
+    match = re.search(
+        r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)",
+        s
+    )
+
+    if match:
+        lo = float(match.group(1))
+        hi = float(match.group(2))
+        return (lo + hi) / 2
+
+    # Single numerical value
+    match = re.search(r"\d+(?:\.\d+)?", s)
+
+    return float(match.group()) if match else np.nan
+
 def clean_species_name(x):
     if pd.isna(x):
         return "unknown"
@@ -153,18 +193,38 @@ def carbon_stock_uncertainty(
 
 def pick_height(row):
     """
-    Prefer observed height if present.
-    Otherwise use inferred height class.
+    Select tree height using the following priority:
+
+    1. Citizen-measured height
+    2. Citizen-estimated height category
+    3. Model-inferred height
     """
-    observed = pd.to_numeric(row.get("HEIGHT_VALUE_M"), errors="coerce")
 
-    if pd.notna(observed):
-        return observed, 1.0, "observed"
+    # =====================================================
+    # 1. Citizen-measured height
+    # =====================================================
 
-    observed_clean = pd.to_numeric(row.get("TREE_HEIGHT_IN_METERS_CLEAN"), errors="coerce")
+    measured = parse_original_height(
+        row.get("TREE_HEIGHT_IN_METERS")
+    )
 
-    if pd.notna(observed_clean):
-        return observed_clean, 1.0, "observed_clean"
+    if pd.notna(measured) and measured > 0:
+        return measured, 1.0, "citizen_measured"
+
+    # =====================================================
+    # 2. Citizen-estimated height
+    # =====================================================
+
+    estimated = parse_original_height(
+        row.get("ESTIMATED_TREE_HEIGHT")
+    )
+
+    if pd.notna(estimated) and estimated > 0:
+        return estimated, 2.5, "citizen_estimated"
+
+    # =====================================================
+    # 3. Model-inferred height
+    # =====================================================
 
     inferred_class = row.get("HEIGHT_CLASS_PRED_STR")
 
@@ -172,13 +232,6 @@ def pick_height(row):
 
     if pd.notna(h):
         return h, u, "model_inferred"
-
-    fallback_class = row.get("HEIGHT_CLASS_STR")
-
-    h, u = height_class_to_midpoint(fallback_class)
-
-    if pd.notna(h):
-        return h, u, "class_midpoint"
 
     return np.nan, np.nan, "missing"
 
@@ -203,6 +256,35 @@ def pick_diameter(row, pred_is_circumference=False):
     """
 
     # =====================================================
+    # Prefer original citizen-provided circumference
+    # =====================================================
+
+    raw_circ = pd.to_numeric(
+        row.get("CIRCUMFERENCE_IN_CM"),
+        errors="coerce"
+    )
+
+    if pd.notna(raw_circ) and raw_circ > 0:
+
+        diameter = float(raw_circ) / np.pi
+
+        method = str(
+            row.get("TREE_CIRCUMFERENCE_METHOD", "")
+        ).lower()
+
+        source = (
+            "citizen_measured"
+            if "tape" in method or "measure" in method
+            else "citizen_reported"
+        )
+
+        return (
+            diameter,
+            max(0.10 * diameter, 2.0),
+            source
+        )
+
+    # =====================================================
     # New TreeCo pipeline: preferred final DBH
     # =====================================================
     final_dbh = pd.to_numeric(
@@ -220,10 +302,14 @@ def pick_diameter(row, pred_is_circumference=False):
         )
 
         if pd.notna(observed_final) and observed_final > 0:
+
+            # This value may originate from an estimated
+            # trunk-size category rather than a tape measurement.
+
             return (
                 float(final_dbh),
                 max(0.10 * float(final_dbh), 2.0),
-                "observed_dbh_final",
+                "citizen_estimated_dbh",
             )
 
         return (
@@ -301,6 +387,21 @@ def pick_diameter(row, pred_is_circumference=False):
 # Core pipeline
 # =========================================================
 
+def aggregate_measurement_sources(series):
+    sources = set(series.dropna().astype(str))
+
+    # Remove missing values
+    sources -= {"missing", "nan", "None", ""}
+
+    if not sources:
+        return "missing"
+
+    if len(sources) == 1:
+        return next(iter(sources))
+
+    # Multiple sources contributed to the aggregated measurement
+    return "mixed: " + ", ".join(sorted(sources))
+
 def build_carbon_table(
     manifest_path: Path,
     pred_is_circumference: bool = False,
@@ -356,6 +457,19 @@ def build_carbon_table(
             r["CARBON_STOCK_KG_IMAGE"],
         ),
         axis=1,
+    )
+
+    # Identify whether height or DBH was inferred
+    df["HEIGHT_MODEL_INFERRED_IMAGE"] = (
+        df["HEIGHT_SOURCE_FINAL_IMAGE"]
+        .astype(str)
+        .str.startswith("model_inferred")
+    )
+
+    df["DIAMETER_MODEL_INFERRED_IMAGE"] = (
+        df["DIAMETER_SOURCE_FINAL_IMAGE"]
+        .astype(str)
+        .str.startswith("model_inferred")
     )
 
     df["CARBON_SEQUESTERED_KG_YR_IMAGE"] = (
@@ -414,8 +528,18 @@ def build_carbon_table(
             KETTLE_BOILS_PER_YEAR=("KETTLE_BOILS_PER_YEAR_IMAGE", "mean"),
             KETTLE_BOILS_UNC_PER_YEAR=("KETTLE_BOILS_UNC_PER_YEAR_IMAGE", "mean"),
 
-            HEIGHT_SOURCE=("HEIGHT_SOURCE_FINAL_IMAGE", first_non_null),
-            DIAMETER_SOURCE=("DIAMETER_SOURCE_FINAL_IMAGE", first_non_null),
+            HEIGHT_SOURCE=(
+                "HEIGHT_SOURCE_FINAL_IMAGE",
+                aggregate_measurement_sources
+            ),
+
+            DIAMETER_SOURCE=(
+                "DIAMETER_SOURCE_FINAL_IMAGE",
+                aggregate_measurement_sources
+            ),
+
+            HEIGHT_MODEL_INFERRED=("HEIGHT_MODEL_INFERRED_IMAGE", "any"),
+            DIAMETER_MODEL_INFERRED=("DIAMETER_MODEL_INFERRED_IMAGE", "any"),
         )
         .reset_index()
     )
@@ -425,6 +549,36 @@ def build_carbon_table(
 
     agg["SPECIES_CLEAN"] = agg["TREE_SPECIES_LABEL"].apply(clean_species_name)
     agg["SPECIES_GROUP"] = agg["SPECIES_CLEAN"].apply(canonical_species_group)
+
+    agg["HAS_MODEL_INFERENCE"] = (agg["HEIGHT_MODEL_INFERRED"]
+                                   |agg["DIAMETER_MODEL_INFERRED"])
+
+    print("\n" + "=" * 60)
+    print("TREE MEASUREMENT SOURCES")
+    print("=" * 60)
+
+    valid = agg[
+        agg["CARBON_SEQUESTERED_KG_YR"].notna()
+    ]
+
+    print("\nHeight sources:")
+    print(valid["HEIGHT_SOURCE"].value_counts())
+
+    print("\nDiameter sources:")
+    print(valid["DIAMETER_SOURCE"].value_counts())
+
+    print("\nSource combinations:")
+    print(
+        valid.groupby(
+            ["HEIGHT_SOURCE", "DIAMETER_SOURCE"]
+        ).size().sort_values(ascending=False)
+    )
+
+    print("\nTotal valid trees:", len(valid))
+    print(
+        "Trees with AI inference:",
+        valid["HAS_MODEL_INFERENCE"].sum()
+    )
 
     print(f"Entry-level rows: {len(agg)}")
     print("Valid carbon rows:", int(agg["CARBON_STOCK_KG"].notna().sum()))
@@ -676,7 +830,7 @@ def build_map(df: pd.DataFrame, out_html: Path):
     m = folium.Map(
         location=[55.8642, -4.2518],
         zoom_start=11,
-        tiles="OpenStreetMap",
+        tiles="Esri.WorldGrayCanvas",
     )
 
     # Make only the basemap grayscale
@@ -704,21 +858,170 @@ def build_map(df: pd.DataFrame, out_html: Path):
         vmax=vmax,
     )
 
-    colormap.caption = "Carbon sequestered (kg C / year)"
-    colormap.add_to(m)
+    # colormap.caption = "Carbon sequestered (kg C / year)"
+    # colormap.add_to(m)
+
+
+
+    # =========================================================
+    # CUSTOM MAP LEGEND — Carbon + AI inference
+    # =========================================================
+
+    n_inferred = int(df_map["HAS_MODEL_INFERENCE"].sum())
+    n_not_inferred = len(df_map) - n_inferred
+
+    midpoint = (vmin + vmax) / 2
+
+    map_legend_html = f"""
+    <div style="
+        position:fixed;
+        top:20px;
+        right:20px;
+        width:450px;
+        max-width:calc(100vw - 40px);
+        box-sizing:border-box;
+        z-index:99999;
+        background:rgba(255,255,255,0.97);
+        padding:20px;
+        border-radius:14px;
+        border-right: 6px solid green;
+        border:2px solid #333;
+        box-shadow:0 4px 18px rgba(0,0,0,0.3);
+        font-family:Arial,sans-serif;
+    ">
+
+        <!-- CARBON COLOUR BAR -->
+
+        <div style="
+            font-size:22px;
+            font-weight:900;
+            margin-bottom:5px;
+        ">
+            Estimated Carbon Sequestration
+        </div>
+
+        <div style="
+            font-size:17px;
+            font-weight:bold;
+            margin-bottom:12px;
+        ">
+            kg C / year
+        </div>
+
+        <div style="
+            width:100%;
+            height:30px;
+            border-radius:5px;
+            border:2px solid #333;
+            box-sizing:border-box;
+            background:linear-gradient(
+                to right,
+                green 0%,
+                yellow 33.33%,
+                orange 66.67%,
+                red 100%
+            );
+        "></div>
+
+        <div style="
+            display:flex;
+            justify-content:space-between;
+            font-size:18px;
+            font-weight:900;
+            margin-top:7px;
+        ">
+            <span>{vmin:.1f}</span>
+            <span>{midpoint:.1f}</span>
+            <span>{vmax:.1f}</span>
+        </div>
+
+        <!-- SEPARATOR -->
+
+        <hr style="
+            border:0;
+            border-top:2px solid #ddd;
+            margin:16px 0;
+        ">
+
+        <!-- AI INFERENCE LEGEND -->
+
+        <div style="
+            font-size:20px;
+            font-weight:900;
+            margin-bottom:14px;
+        ">
+            Tree Measurement Sources
+        </div>
+
+        <div style="
+            display:flex;
+            align-items:center;
+            gap:12px;
+            margin-bottom:12px;
+            font-size:17px;
+            font-weight:bold;
+        ">
+            <span style="
+                display:inline-block;
+                width:19px;
+                height:19px;
+                flex-shrink:0;
+                border-radius:50%;
+                background:#61b84b;
+                border:4px solid black;
+            "></span>
+
+            Inferred height and/or DBH ({n_inferred})
+        </div>
+
+        <div style="
+            display:flex;
+            align-items:center;
+            gap:12px;
+            font-size:17px;
+            font-weight:bold;
+        ">
+            <span style="
+                display:inline-block;
+                width:19px;
+                height:19px;
+                flex-shrink:0;
+                border-radius:50%;
+                background:#61b84b;
+                border:2px solid white;
+                outline:1px solid #aaa;
+            "></span>
+
+            Observed (est./mea.) dimensions ({n_not_inferred})
+        </div>
+
+        <div style="
+            font-size:14px;
+            margin-top:15px;
+            color:#555;
+        ">
+            Circle colour and size indicate estimated carbon sequestration.
+        </div>
+
+    </div>
+    """
+
+    m.get_root().html.add_child(Element(map_legend_html))
 
     for _, row in df_map.iterrows():
         seq = float(row["CARBON_SEQUESTERED_KG_YR"])
         color = colormap(seq)
+        inferred = bool(row["HAS_MODEL_INFERENCE"])
 
         folium.CircleMarker(
             location=[row["LATITUDE"], row["LONGITUDE"]],
             radius=marker_radius(seq, vmin, vmax),
-            color=color,
+            # Highlight model-inferred measurements
+            color="#000000" if inferred else "#ffffff",
+            weight=3.5 if inferred else 1.0,
             fill=True,
             fill_color=color,
-            fill_opacity=0.85,
-            weight=2,
+            fill_opacity=0.85 if inferred else 0.55,
             popup=folium.Popup(
                 make_popup_html(row, colormap),
                 max_width=420,
@@ -752,6 +1055,7 @@ def build_map(df: pd.DataFrame, out_html: Path):
         border-radius: 12px;
         padding: 15px;
         box-shadow: 0 0 15px rgba(0,0,0,0.25);
+        border: 2px solid #333;
         border-left: 6px solid green;
         font-family: Arial, sans-serif;
     ">

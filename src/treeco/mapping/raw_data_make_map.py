@@ -105,36 +105,81 @@ def parse_numeric(x):
 
 
 def parse_height(row):
-    for col in ["TREE_HEIGHT_IN_METERS", "TREE_HEIGHT_IN_METERS_CLEAN", "HEIGHT_VALUE_M"]:
-        if col in row.index:
-            h = parse_numeric(row.get(col))
-            if pd.notna(h):
-                return h, 1.0, col
+    """Use ALL citizen-provided heights; numeric measurements before categories.
 
-    for col in ["ESTIMATED_TREE_HEIGHT", "ESTIMATED_TREE_HEIGHT_CLEAN", "HEIGHT_CLASS_STR"]:
-        if col in row.index:
-            label = row.get(col)
+    Raw height ranges are interpreted using their midpoints, consistently
+    with the updated TreeCo mapping pipeline (e.g. 2-5 -> 3.5 metres).
+    """
+    for col in ("TREE_HEIGHT_IN_METERS", "TREE_HEIGHT_IN_METERS_CLEAN"):
+        value = row.get(col)
+        if pd.notna(value) and str(value).strip():
+            height = parse_numeric(value)
+            if pd.notna(height) and height > 0:
+                return float(height), 1.0, "citizen_measured"
 
-            if pd.notna(label):
-                label = str(label).strip()
+    for col in ("ESTIMATED_TREE_HEIGHT", "ESTIMATED_TREE_HEIGHT_CLEAN", "HEIGHT_CLASS_STR"):
+        value = row.get(col)
+        if pd.isna(value) or not str(value).strip():
+            continue
 
-                if label in HEIGHT_CLASS_MAP:
-                    h, u = HEIGHT_CLASS_MAP[label]
-                    return h, u, col
+        label = str(value).strip().lower().replace("–", "-").replace("—", "-")
+        if label in HEIGHT_CLASS_MAP:
+            height, uncertainty = HEIGHT_CLASS_MAP[label]
+        else:
+            height, uncertainty = parse_numeric(label), 2.5
 
-                h = parse_numeric(label)
-                if pd.notna(h):
-                    return h, 2.5, col
+        if pd.notna(height) and height > 0:
+            return float(height), float(uncertainty), "citizen_estimated"
 
+    # HEIGHT_VALUE_M may exist in processed data but is not a reliable
+    # measurement-provenance indicator. Never use it to claim 'measured'.
     return np.nan, np.nan, "missing"
 
 
+def trunk_size_to_circumference_cm(value):
+    """Turn a citizen trunk-size category into an estimated circumference.
+
+    Mirrors the TreeCo dataset-builder convention; the assumption that
+    TREE_TRUNK_SIZE denotes *circumference*, not diameter, must be verified.
+    """
+    if pd.isna(value):
+        return np.nan
+    s = str(value).strip().lower().replace("–", "-").replace("—", "-")
+
+    match = re.search(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)", s)
+    if match:
+        return (float(match.group(1)) + float(match.group(2))) / 2.0
+
+    match = re.search(r"(\d+(?:\.\d+)?)\s*\+", s)
+    return float(match.group(1)) if match else np.nan
+
+
 def parse_circumference(row):
-    for col in ["CIRCUMFERENCE_IN_CM", "CIRCUMFERENCE_CM_CLEAN"]:
-        if col in row.index:
-            c = parse_numeric(row.get(col))
-            if pd.notna(c):
-                return c, max(0.1 * c, 5.0), col
+    """Keep measured circumference AND citizen-estimated trunk-size bins.
+
+    Consistent priority with the revised TreeCo inference map:
+    measured raw circumference > estimated trunk-size category > raw
+    numeric fallback > cleaned numeric fallback. No AI values are used.
+    """
+    method = str(row.get("TREE_CIRCUMFERENCE_METHOD", "") or "").strip().lower()
+    is_measured = "tape" in method or "measure" in method
+    raw = parse_numeric(row.get("CIRCUMFERENCE_IN_CM"))
+    estimated = trunk_size_to_circumference_cm(row.get("TREE_TRUNK_SIZE"))
+
+    if is_measured and pd.notna(raw) and raw > 0:
+        return float(raw), max(0.10 * float(raw), 2.0 * np.pi), "citizen_measured"
+
+    if pd.notna(estimated) and estimated > 0:
+        return float(estimated), max(0.10 * float(estimated), 2.0 * np.pi), "citizen_estimated_trunk_size"
+
+    # Retain numerical citizen contributions even if their method wasn't
+    # recorded. These are reported, not confirmed tape-measured.
+    if pd.notna(raw) and raw > 0:
+        return float(raw), max(0.10 * float(raw), 2.0 * np.pi), "citizen_reported_numeric"
+
+    clean = parse_numeric(row.get("CIRCUMFERENCE_CM_CLEAN"))
+    if pd.notna(clean) and clean > 0:
+        return float(clean), max(0.10 * float(clean), 2.0 * np.pi), "citizen_reported_clean"
 
     return np.nan, np.nan, "missing"
 
@@ -317,112 +362,166 @@ def load_table(path):
 
 
 def list_images_for_group(group):
-    urls = []
+    """Keep ALL original image URLs, including rows lacking dimensions."""
     media_cols = find_media_cols(group)
-
+    urls = []
     for _, row in group.iterrows():
         for col in media_cols:
-            val = row.get(col)
-            if pd.notna(val) and str(val).startswith("http"):
-                urls.append(str(val))
-
+            value = row.get(col)
+            if pd.notna(value) and str(value).strip().startswith("http"):
+                urls.append(str(value).strip())
     return list(dict.fromkeys(urls))
 
 
-def first_non_null(series):
-    s = series.dropna()
-    if len(s) == 0:
-        return np.nan
-    return s.iloc[0]
+def first_non_missing_source(series):
+    present = [str(s) for s in series.dropna() if str(s).strip().lower() not in {"", "missing", "nan"}]
+    if not present:
+        return "missing"
+    distinct = list(dict.fromkeys(present))
+    return distinct[0] if len(distinct) == 1 else "mixed: " + ", ".join(distinct)
 
 
 def aggregate_to_entry_level(df):
+    """Do not discard an entry or its photographs if dimensions are missing."""
     rows = []
-
     numeric_avg_cols = [
-        "HEIGHT_M",
-        "HEIGHT_UNC_M",
-        "CIRCUMFERENCE_CM",
-        "CIRCUMFERENCE_UNC_CM",
-        "DIAMETER_CM",
-        "DIAMETER_UNC_CM",
-        "CARBON_STOCK_KG",
-        "CARBON_STOCK_UNC_KG",
-        "CARBON_SEQUESTERED_KG_YR",
-        "CARBON_SEQUESTERED_UNC_KG_YR",
-        "CO2_SEQUESTERED_KG_YR",
-        "CO2_SEQUESTERED_UNC_KG_YR",
-        "KETTLE_BOILS_PER_YEAR",
-        "KETTLE_BOILS_UNC_PER_YEAR",
+        "HEIGHT_M", "HEIGHT_UNC_M", "CIRCUMFERENCE_CM", "CIRCUMFERENCE_UNC_CM",
+        "DIAMETER_CM", "DIAMETER_UNC_CM", "CARBON_STOCK_KG", "CARBON_STOCK_UNC_KG",
+        "CARBON_SEQUESTERED_KG_YR", "CARBON_SEQUESTERED_UNC_KG_YR",
+        "CO2_SEQUESTERED_KG_YR", "CO2_SEQUESTERED_UNC_KG_YR",
+        "KETTLE_BOILS_PER_YEAR", "KETTLE_BOILS_UNC_PER_YEAR",
     ]
 
-    for tree_id, group in df.groupby("ID", dropna=False):
-        first = group.iloc[0].copy()
-        out = first.to_dict()
-
-        out["N_ROWS_FOR_ID"] = int(len(group))
+    for tree_id, group in df.groupby("ID", dropna=False, sort=False):
+        out = group.iloc[0].to_dict()
+        out["N_ROWS_FOR_ID"] = len(group)
         out["IMAGE_URLS"] = list_images_for_group(group)
+        out["N_ORIGINAL_IMAGES"] = len(out["IMAGE_URLS"])
 
+        # Use the first *valid pair* of coordinates rather than blindly
+        # taking coordinates from the first record for that ID.
+        coords = group[
+            group["LATITUDE"].between(-90, 90)
+            & group["LONGITUDE"].between(-180, 180)
+        ]
+        if not coords.empty:
+            out["LATITUDE"] = float(coords.iloc[0]["LATITUDE"])
+            out["LONGITUDE"] = float(coords.iloc[0]["LONGITUDE"])
+        else:
+            out["LATITUDE"] = np.nan
+            out["LONGITUDE"] = np.nan
+
+        # Keep dimensions used for the carbon estimate consistent with its
+        # contributing rows. Other citizen records still contribute images
+        # and remain accessible in the raw-row audit CSV.
+        paired = group.loc[group["ROW_HAS_BOTH_DIMENSIONS"]]
+        dimension_rows = paired if not paired.empty else group
         for col in numeric_avg_cols:
-            if col in group.columns:
-                out[col] = pd.to_numeric(group[col], errors="coerce").mean()
+            rows_for_col = dimension_rows if col in {
+                "HEIGHT_M", "HEIGHT_UNC_M", "CIRCUMFERENCE_CM",
+                "CIRCUMFERENCE_UNC_CM", "DIAMETER_CM", "DIAMETER_UNC_CM"
+            } else group
+            out[col] = pd.to_numeric(rows_for_col[col], errors="coerce").mean()
 
-        out["HEIGHT_SOURCE"] = first_non_null(group["HEIGHT_SOURCE"]) if "HEIGHT_SOURCE" in group.columns else np.nan
-        out["CIRCUMFERENCE_SOURCE"] = first_non_null(group["CIRCUMFERENCE_SOURCE"]) if "CIRCUMFERENCE_SOURCE" in group.columns else np.nan
-
+        out["HEIGHT_SOURCE"] = first_non_missing_source(dimension_rows["HEIGHT_SOURCE"])
+        out["CIRCUMFERENCE_SOURCE"] = first_non_missing_source(dimension_rows["CIRCUMFERENCE_SOURCE"])
+        out["HAS_ANY_MEASURED_OR_ESTIMATED_HEIGHT"] = bool(group["HEIGHT_M"].notna().any())
+        out["HAS_ANY_MEASURED_OR_ESTIMATED_CIRCUMFERENCE"] = bool(group["CIRCUMFERENCE_CM"].notna().any())
+        out["N_ROWS_WITH_BOTH_DIMENSIONS"] = int(group["ROW_HAS_BOTH_DIMENSIONS"].sum())
+        out["COMBINED_ACROSS_ROWS"] = False
         rows.append(out)
 
-    return pd.DataFrame(rows)
+    out_df = pd.DataFrame(rows)
+    if out_df.empty:
+        return out_df
+
+    # If one record has a height, another record of the SAME entry has
+    # circumference, we have enough citizen information even if neither
+    # individual record had both. Only fill estimates previously missing.
+    combine = (
+        out_df["CARBON_STOCK_KG"].isna()
+        & out_df["HEIGHT_M"].gt(0)
+        & out_df["DIAMETER_CM"].gt(0)
+    )
+    out_df.loc[combine, "COMBINED_ACROSS_ROWS"] = True
+    if combine.any():
+        out_df.loc[combine, "CARBON_STOCK_KG"] = out_df.loc[combine].apply(
+            lambda r: carbon_stock_from_height_diameter(r["HEIGHT_M"], r["DIAMETER_CM"]), axis=1
+        )
+        out_df.loc[combine, "CARBON_STOCK_UNC_KG"] = out_df.loc[combine].apply(
+            lambda r: carbon_stock_uncertainty(
+                r["HEIGHT_M"], r["HEIGHT_UNC_M"], r["DIAMETER_CM"],
+                r["DIAMETER_UNC_CM"], r["CARBON_STOCK_KG"]
+            ), axis=1
+        )
+        carbon = out_df.loc[combine, "CARBON_STOCK_KG"]
+        carbon_unc = out_df.loc[combine, "CARBON_STOCK_UNC_KG"]
+        out_df.loc[combine, "CARBON_SEQUESTERED_KG_YR"] = carbon * SEQ_RATE_MEAN
+        out_df.loc[combine, "CARBON_SEQUESTERED_UNC_KG_YR"] = np.sqrt(
+            (carbon * SEQ_RATE_UNC) ** 2 + (SEQ_RATE_MEAN * carbon_unc) ** 2
+        )
+        out_df.loc[combine, "CO2_SEQUESTERED_KG_YR"] = (
+            out_df.loc[combine, "CARBON_SEQUESTERED_KG_YR"] * (44.0 / 12.0)
+        )
+        out_df.loc[combine, "CO2_SEQUESTERED_UNC_KG_YR"] = (
+            out_df.loc[combine, "CARBON_SEQUESTERED_UNC_KG_YR"] * (44.0 / 12.0)
+        )
+        out_df.loc[combine, "KETTLE_BOILS_PER_YEAR"] = (
+            out_df.loc[combine, "CO2_SEQUESTERED_KG_YR"] / KG_CO2E_PER_KETTLE_BOIL
+        )
+        out_df.loc[combine, "KETTLE_BOILS_UNC_PER_YEAR"] = (
+            out_df.loc[combine, "CO2_SEQUESTERED_UNC_KG_YR"] / KG_CO2E_PER_KETTLE_BOIL
+        )
+
+    out_df["HAS_CARBON_ESTIMATE"] = out_df["CARBON_SEQUESTERED_KG_YR"].notna()
+    out_df["HAS_COORDINATES"] = (
+        out_df["LATITUDE"].between(-90, 90)
+        & out_df["LONGITUDE"].between(-180, 180)
+    )
+    return out_df
 
 
 # =========================================================
 # Carbon table
 # =========================================================
 
-def build_raw_carbon_table(input_path):
+def build_raw_carbon_table(input_path, raw_rows_output=None):
     df = load_table(input_path)
-
     print(f"Loaded: {input_path}")
     print(f"Rows before filtering: {len(df)}")
 
     if "TREE" in df.columns:
-        df = df[df["TREE"].astype(str).str.lower().eq("yes")].copy()
+        df = df[df["TREE"].astype(str).str.strip().str.lower().eq("yes")].copy()
 
-    print(f"Tree rows: {len(df)}")
+    print(f"Tree contribution rows (all retained): {len(df)}")
+    if df.empty:
+        return pd.DataFrame()
+
+    df["ID"] = df["ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    df["LATITUDE"] = pd.to_numeric(df["LATITUDE"], errors="coerce")
+    df["LONGITUDE"] = pd.to_numeric(df["LONGITUDE"], errors="coerce")
 
     height_rows = df.apply(parse_height, axis=1)
     df[["HEIGHT_M", "HEIGHT_UNC_M", "HEIGHT_SOURCE"]] = pd.DataFrame(
-        height_rows.tolist(),
-        index=df.index,
+        height_rows.tolist(), index=df.index
     )
 
     circ_rows = df.apply(parse_circumference, axis=1)
     df[["CIRCUMFERENCE_CM", "CIRCUMFERENCE_UNC_CM", "CIRCUMFERENCE_SOURCE"]] = pd.DataFrame(
-        circ_rows.tolist(),
-        index=df.index,
+        circ_rows.tolist(), index=df.index
     )
 
     df["DIAMETER_CM"] = df["CIRCUMFERENCE_CM"] / np.pi
     df["DIAMETER_UNC_CM"] = df["CIRCUMFERENCE_UNC_CM"] / np.pi
 
-    valid = (
-        df["LATITUDE"].notna()
-        & df["LONGITUDE"].notna()
-        & df["HEIGHT_M"].notna()
-        & df["DIAMETER_CM"].notna()
-    )
-
-    df = df[valid].copy()
-
-    print(f"Rows with observed height + circumference + coordinates: {len(df)}")
+    df["ROW_HAS_BOTH_DIMENSIONS"] = df["HEIGHT_M"].gt(0) & df["DIAMETER_CM"].gt(0)
+    print("Rows with both citizen dimensions:", int(df["ROW_HAS_BOTH_DIMENSIONS"].sum()))
 
     if "TREE_TYPE" in df.columns:
         species = df["TREE_TYPE"].copy()
-
         if "OTHER_TREE" in df.columns:
             other_mask = species.astype(str).str.lower().eq("other")
             species.loc[other_mask] = df.loc[other_mask, "OTHER_TREE"]
-
         df["SPECIES"] = species
     else:
         df["SPECIES"] = "unknown"
@@ -430,48 +529,44 @@ def build_raw_carbon_table(input_path):
     df["SPECIES_CLEAN"] = df["SPECIES"].apply(clean_species_name)
     df["SPECIES_GROUP"] = df["SPECIES_CLEAN"].apply(canonical_species_group)
 
+    # Incomplete rows are NOT filtered out. They naturally receive NaN
+    # carbon, while their labels/images remain available for aggregation.
     df["CARBON_STOCK_KG"] = df.apply(
-        lambda r: carbon_stock_from_height_diameter(
-            r["HEIGHT_M"],
-            r["DIAMETER_CM"],
-        ),
-        axis=1,
+        lambda r: carbon_stock_from_height_diameter(r["HEIGHT_M"], r["DIAMETER_CM"]), axis=1
     )
-
     df["CARBON_STOCK_UNC_KG"] = df.apply(
         lambda r: carbon_stock_uncertainty(
-            r["HEIGHT_M"],
-            r["HEIGHT_UNC_M"],
-            r["DIAMETER_CM"],
-            r["DIAMETER_UNC_CM"],
-            r["CARBON_STOCK_KG"],
-        ),
-        axis=1,
+            r["HEIGHT_M"], r["HEIGHT_UNC_M"], r["DIAMETER_CM"],
+            r["DIAMETER_UNC_CM"], r["CARBON_STOCK_KG"]
+        ), axis=1
     )
 
     df["SEQ_RATE_YR"] = SEQ_RATE_MEAN
     df["SEQ_RATE_UNC_YR"] = SEQ_RATE_UNC
-
-    df["CARBON_SEQUESTERED_KG_YR"] = df["CARBON_STOCK_KG"] * df["SEQ_RATE_YR"]
-
+    df["CARBON_SEQUESTERED_KG_YR"] = df["CARBON_STOCK_KG"] * SEQ_RATE_MEAN
     df["CARBON_SEQUESTERED_UNC_KG_YR"] = np.sqrt(
-        (df["CARBON_STOCK_KG"] * df["SEQ_RATE_UNC_YR"]) ** 2
-        + (df["SEQ_RATE_YR"] * df["CARBON_STOCK_UNC_KG"]) ** 2
+        (df["CARBON_STOCK_KG"] * SEQ_RATE_UNC) ** 2
+        + (SEQ_RATE_MEAN * df["CARBON_STOCK_UNC_KG"]) ** 2
     )
-
-    co2_factor = 44.0 / 12.0
-
-    df["CO2_SEQUESTERED_KG_YR"] = df["CARBON_SEQUESTERED_KG_YR"] * co2_factor
-    df["CO2_SEQUESTERED_UNC_KG_YR"] = df["CARBON_SEQUESTERED_UNC_KG_YR"] * co2_factor
-
+    df["CO2_SEQUESTERED_KG_YR"] = df["CARBON_SEQUESTERED_KG_YR"] * (44.0 / 12.0)
+    df["CO2_SEQUESTERED_UNC_KG_YR"] = df["CARBON_SEQUESTERED_UNC_KG_YR"] * (44.0 / 12.0)
     df["KETTLE_BOILS_PER_YEAR"] = df["CO2_SEQUESTERED_KG_YR"] / KG_CO2E_PER_KETTLE_BOIL
     df["KETTLE_BOILS_UNC_PER_YEAR"] = df["CO2_SEQUESTERED_UNC_KG_YR"] / KG_CO2E_PER_KETTLE_BOIL
 
+    # Save every original TREE=yes contribution row, including rows with
+    # no size measurements, before collapsing multiple rows to each tree ID.
+    if raw_rows_output is not None:
+        df.to_csv(raw_rows_output, index=False)
+        print(f"Saved every raw citizen tree row to: {raw_rows_output}")
+
     df_entry = aggregate_to_entry_level(df)
-
-    print(f"Entry-level rows after ID aggregation: {len(df_entry)}")
-    print("Non-null carbon rows:", int(df_entry["CARBON_STOCK_KG"].notna().sum()))
-
+    print("All unique citizen tree entries:", len(df_entry))
+    print("Entries with both usable citizen dimensions:", int(df_entry["HAS_CARBON_ESTIMATE"].sum()))
+    print("Entries completing dimensions across rows:", int(df_entry["COMBINED_ACROSS_ROWS"].sum()))
+    print("Entries with location and carbon:", int((df_entry["HAS_CARBON_ESTIMATE"] & df_entry["HAS_COORDINATES"]).sum()))
+    print("Entries preserved without carbon estimate:", int((~df_entry["HAS_CARBON_ESTIMATE"]).sum()))
+    print("Citizen height sources:\n", df_entry["HEIGHT_SOURCE"].value_counts().to_string())
+    print("Citizen circumference sources:\n", df_entry["CIRCUMFERENCE_SOURCE"].value_counts().to_string())
     return df_entry
 
 
@@ -653,44 +748,46 @@ def make_image_scroller(image_urls, color):
     """
 
 
-def make_popup_html(row, colormap):
-    c_seq = row["CARBON_SEQUESTERED_KG_YR"]
-    c_seq_unc = row["CARBON_SEQUESTERED_UNC_KG_YR"]
-    co2_seq = row["CO2_SEQUESTERED_KG_YR"]
-    co2_seq_unc = row["CO2_SEQUESTERED_UNC_KG_YR"]
-    kettles = row["KETTLE_BOILS_PER_YEAR"]
-    kettles_unc = row["KETTLE_BOILS_UNC_PER_YEAR"]
+def fmt(value, digits=1):
+    return "Not provided" if pd.isna(value) else f"{float(value):,.{digits}f}"
 
-    color = colormap(c_seq)
-    img_html = make_image_scroller(row.get("IMAGE_URLS", []), color)
+
+def make_popup_html(row, colormap):
+    seq = row.get("CARBON_SEQUESTERED_KG_YR", np.nan)
+    has_carbon = pd.notna(seq)
+    color = colormap(float(seq)) if has_carbon else "#888888"
+    images = make_image_scroller(row.get("IMAGE_URLS", []), color)
+
+    if has_carbon:
+        carbon_info = f"""
+            <div style="font-size:24px;font-weight:900;color:{color};text-align:center;">
+                {fmt(seq, 3)} ± {fmt(row.get('CARBON_SEQUESTERED_UNC_KG_YR'), 3)} kg C / yr
+            </div>
+            <div style="font-size:14px;text-align:center;">
+                {fmt(row.get('CO2_SEQUESTERED_KG_YR'), 3)} kg CO₂e / yr
+                · ≈ {fmt(row.get('KETTLE_BOILS_PER_YEAR'), 1)} kettle boils / yr
+            </div>"""
+    else:
+        carbon_info = """
+            <div style="font-size:19px;font-weight:800;color:#666;text-align:center;">
+                No carbon estimate (missing citizen dimension)
+            </div>"""
 
     return f"""
-    <div style="width:375px; font-family:Arial, sans-serif;">
-        <div style="font-size:24px; font-weight:900; color:{color}; text-align:center;">
-            {c_seq:.3f} ± {c_seq_unc:.3f} kg C / yr
+    <div style="width:375px;font-family:Arial,sans-serif;">
+        {carbon_info}
+        <div style="font-size:13px;text-align:center;margin:10px 0;">
+            {int(row.get('N_ROWS_FOR_ID', 1))} original record(s) ·
+            {int(row.get('N_ORIGINAL_IMAGES', 0))} original photograph(s)
         </div>
-
-        <div style="font-size:14px; text-align:center; margin-bottom:10px;">
-            Average across {int(row.get("N_ROWS_FOR_ID", 1))} row(s) for this ID
-        </div>
-
-        <div style="font-size:15px; text-align:center; margin-bottom:10px;">
-            {co2_seq:.3f} ± {co2_seq_unc:.3f} kg CO₂e / yr
-        </div>
-
-        <div style="font-size:15px; text-align:center; margin-bottom:10px;">
-            ≈ {kettles:,.1f} ± {kettles_unc:,.1f} kettle boils / yr
-        </div>
-
-        <div><b>ID:</b> {row.get("ID", "NA")}</div>
-        <div><b>Species:</b> {row.get("SPECIES_GROUP", "unknown")}</div>
-        <div><b>Height:</b> {row.get("HEIGHT_M", np.nan):.1f} ± {row.get("HEIGHT_UNC_M", np.nan):.1f} m</div>
-        <div><b>Circumference:</b> {row.get("CIRCUMFERENCE_CM", np.nan):.1f} cm</div>
-        <div><b>Diameter:</b> {row.get("DIAMETER_CM", np.nan):.1f} ± {row.get("DIAMETER_UNC_CM", np.nan):.1f} cm</div>
-        <div><b>Height source:</b> {row.get("HEIGHT_SOURCE")}</div>
-        <div><b>Circumference source:</b> {row.get("CIRCUMFERENCE_SOURCE")}</div>
-
-        {img_html}
+        <div><b>ID:</b> {row.get('ID', 'NA')}</div>
+        <div><b>Species:</b> {row.get('SPECIES_GROUP', 'unknown')}</div>
+        <div><b>Height:</b> {fmt(row.get('HEIGHT_M'))} ± {fmt(row.get('HEIGHT_UNC_M'))} m</div>
+        <div><b>Circumference:</b> {fmt(row.get('CIRCUMFERENCE_CM'))} cm</div>
+        <div><b>Diameter:</b> {fmt(row.get('DIAMETER_CM'))} ± {fmt(row.get('DIAMETER_UNC_CM'))} cm</div>
+        <div><b>Height source:</b> {row.get('HEIGHT_SOURCE', 'missing')}</div>
+        <div><b>Circumference source:</b> {row.get('CIRCUMFERENCE_SOURCE', 'missing')}</div>
+        {images}
     </div>
     """
 
@@ -706,109 +803,92 @@ def marker_radius(value, vmin, vmax):
 
 
 def build_map(df, out_html):
-    df_map = df[
-        df["LATITUDE"].notna()
-        & df["LONGITUDE"].notna()
-        & df["CARBON_SEQUESTERED_KG_YR"].notna()
-    ].copy()
+    # Every raw tree entry is preserved in the all-entries CSV. Only valid
+    # geographical positions can be mapped; non-estimable trees are shown
+    # as a separate, toggleable grey layer rather than being discarded.
+    geo = df[df["HAS_COORDINATES"]].copy()
+    with_carbon = geo[geo["CARBON_SEQUESTERED_KG_YR"].notna()].copy()
+    without_carbon = geo[geo["CARBON_SEQUESTERED_KG_YR"].isna()].copy()
 
-    print(f"Entry-level rows going into map: {len(df_map)}")
+    print("Map: citizen-only carbon estimates:", len(with_carbon))
+    print("Map: other citizen tree observations (grey):", len(without_carbon))
+    print("Not mappable (missing/invalid coordinates):", len(df) - len(geo))
 
-    if df_map.empty:
-        print("No valid rows for map.")
+    if geo.empty:
+        print("No tree entries with valid coordinates to plot.")
         return
 
-    m = folium.Map(
-            location=[55.8642, -4.2518],
-            zoom_start=11,
-            tiles="OpenStreetMap",
-        )
-    
-    # Make only the basemap grayscale
-    gray_map_css = """
-    <style>
-    .leaflet-tile-pane {
-        filter: grayscale(100%) brightness(105%) contrast(90%);
-    }
-    </style>
-    """
+    m = folium.Map(location=[55.8642, -4.2518], zoom_start=11, tiles="Esri.WorldGrayCanvas")
+    m.get_root().header.add_child(Element("""
+    <style>.leaflet-tile-pane { filter: grayscale(100%) brightness(105%) contrast(90%); }</style>
+    """))
 
-    m.get_root().header.add_child(
-        Element(gray_map_css)
-)
+    if with_carbon.empty:
+        vmin, vmax = 0.0, 1.0
+    else:
+        vmin = float(with_carbon["CARBON_SEQUESTERED_KG_YR"].min())
+        vmax = float(with_carbon["CARBON_SEQUESTERED_KG_YR"].max())
+        if vmin == vmax:
+            vmax = vmin + 1e-6
 
-    vmin = float(df_map["CARBON_SEQUESTERED_KG_YR"].min())
-    vmax = float(df_map["CARBON_SEQUESTERED_KG_YR"].max())
+    colormap = cm.LinearColormap(colors=["green", "yellow", "orange", "red"], vmin=vmin, vmax=vmax)
+    colormap.caption = "Carbon sequestration from citizen-provided measurements and estimates (kg C/year)"
+    if not with_carbon.empty:
+        colormap.add_to(m)
 
-    if vmin == vmax:
-        vmax = vmin + 1e-6
+    carbon_layer = folium.FeatureGroup(name=f"Citizen-only carbon estimates ({len(with_carbon)})", show=True)
+    other_layer = folium.FeatureGroup(name=f"Other citizen tree observations ({len(without_carbon)})", show=False)
 
-    colormap = cm.LinearColormap(
-        colors=["green", "yellow", "orange", "red"],
-        vmin=vmin,
-        vmax=vmax,
-    )
-
-    colormap.caption = "Carbon sequestered from observed data only (kg C / year)"
-    colormap.add_to(m)
-
-    for _, row in df_map.iterrows():
+    for _, row in with_carbon.iterrows():
         seq = float(row["CARBON_SEQUESTERED_KG_YR"])
         color = colormap(seq)
-
         folium.CircleMarker(
-            location=[row["LATITUDE"], row["LONGITUDE"]],
-            radius=marker_radius(seq, vmin, vmax),
-            color=color,
-            fill=True,
-            fill_color=color,
-            fill_opacity=0.85,
-            weight=2,
+            location=[float(row["LATITUDE"]), float(row["LONGITUDE"])],
+            radius=marker_radius(seq, vmin, vmax), color=color, fill=True,
+            fill_color=color, fill_opacity=0.85, weight=2,
             popup=folium.Popup(make_popup_html(row, colormap), max_width=420),
-        ).add_to(m)
+        ).add_to(carbon_layer)
 
-    total_c = df_map["CARBON_SEQUESTERED_KG_YR"].sum()
-    total_c_unc = np.sqrt(np.square(df_map["CARBON_SEQUESTERED_UNC_KG_YR"].fillna(0)).sum())
+    for _, row in without_carbon.iterrows():
+        folium.CircleMarker(
+            location=[float(row["LATITUDE"]), float(row["LONGITUDE"])],
+            radius=4, color="#666666", fill=True,
+            fill_color="#999999", fill_opacity=0.5, weight=1,
+            popup=folium.Popup(make_popup_html(row, colormap), max_width=420),
+        ).add_to(other_layer)
 
-    total_co2 = df_map["CO2_SEQUESTERED_KG_YR"].sum()
-    total_co2_unc = np.sqrt(np.square(df_map["CO2_SEQUESTERED_UNC_KG_YR"].fillna(0)).sum())
+    carbon_layer.add_to(m)
+    other_layer.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
 
-    total_kettles = df_map["KETTLE_BOILS_PER_YEAR"].sum()
-    total_kettles_unc = np.sqrt(np.square(df_map["KETTLE_BOILS_UNC_PER_YEAR"].fillna(0)).sum())
+    total_c = with_carbon["CARBON_SEQUESTERED_KG_YR"].sum()
+    total_c_unc = np.sqrt(np.square(with_carbon["CARBON_SEQUESTERED_UNC_KG_YR"].fillna(0)).sum())
+    total_co2 = with_carbon["CO2_SEQUESTERED_KG_YR"].sum()
+    total_co2_unc = np.sqrt(np.square(with_carbon["CO2_SEQUESTERED_UNC_KG_YR"].fillna(0)).sum())
+    total_kettles = with_carbon["KETTLE_BOILS_PER_YEAR"].sum()
+    total_kettles_unc = np.sqrt(np.square(with_carbon["KETTLE_BOILS_UNC_PER_YEAR"].fillna(0)).sum())
 
     summary_html = f"""
-    <div style="
-        position: fixed;
-        bottom: 30px;
-        left: 30px;
-        width: 330px;
-        z-index: 9999;
-        font-size: 15px;
-        background-color: white;
-        border-radius: 12px;
-        padding: 15px;
-        box-shadow: 0 0 15px rgba(0,0,0,0.25);
-        border-left: 6px solid green;
-        font-family: Arial, sans-serif;
-    ">
-        <div style="font-size:18px; font-weight:800; margin-bottom:10px;">
-            Observed-only carbon estimates from {len(df_map)} tree entries
+    <div style="position:fixed;bottom:30px;left:30px;width:330px;z-index:9999;
+                font-size:15px;background:white;border:2px solid #333;border-radius:12px;
+                padding:15px;box-shadow:0 0 15px rgba(0,0,0,0.25);font-family:Arial,sans-serif;">
+        <div style="font-size:18px;font-weight:800;margin-bottom:10px;">
+            Citizen contributions: {len(with_carbon)} carbon-estimable tree entries
         </div>
-
+        <div style="font-size:12px;color:#666;margin-bottom:10px;">
+            {len(without_carbon)} more mapped entries lack a dimension (toggle grey layer);
+            {len(df) - len(geo)} entries lack valid coordinates.
+        </div>
         <b>Total C sequestration:</b><br>
         {total_c:,.2f} ± {total_c_unc:,.2f} kg C / year<br><br>
-
         <b>Total CO₂e sequestration:</b><br>
         {total_co2:,.2f} ± {total_co2_unc:,.2f} kg CO₂e / year<br><br>
-
         <b>Kettle boils equivalent:</b><br>
         {total_kettles:,.0f} ± {total_kettles_unc:,.0f} kettle boils / year
     </div>
     """
-
     m.get_root().html.add_child(Element(summary_html))
     m.save(str(out_html))
-
     print(f"Saved map to: {out_html}")
 
 
@@ -818,7 +898,7 @@ def build_map(df, out_html):
 
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="Make an observed-only tree carbon/sequestration map from raw CommuniMap XLSX/CSV."
+        description="Map ALL raw CommuniMap tree contributions; estimate carbon from available citizen measurements or size-category estimates (no AI)."
     )
 
     ap.add_argument(
@@ -838,7 +918,19 @@ def parse_args():
 
     ap.add_argument(
         "--csv-name",
-        default="raw_observed_tree_carbon_estimates_entry_level.csv",
+        default="raw_observed_tree_carbon_estimates_entry_level.csv",  # retained for old comparison scripts
+    )
+
+    ap.add_argument(
+        "--raw-rows-csv-name",
+        default="raw_citizen_all_tree_rows.csv",
+        help="All TREE=yes raw records with parsed measurements, unaggregated.",
+    )
+
+    ap.add_argument(
+        "--all-csv-name",
+        default="raw_citizen_all_tree_entries.csv",
+        help="Audit CSV retaining every tree entry, including missing dimensions or coordinates.",
     )
 
     ap.add_argument(
@@ -854,13 +946,23 @@ def main():
 
     args.outdir.mkdir(parents=True, exist_ok=True)
 
-    df = build_raw_carbon_table(args.input_xlsx)
+    df = build_raw_carbon_table(
+        args.input_xlsx,
+        raw_rows_output=args.outdir / args.raw_rows_csv_name,
+    )
 
     out_csv = args.outdir / args.csv_name
     out_map = args.outdir / args.map_name
 
-    df.to_csv(out_csv, index=False)
-    print(f"Saved CSV to: {out_csv}")
+    # Preserve EVERY tree entry in an audit CSV. Carbon CSV stays compatible
+    # with earlier workflows by containing only entries having mapped carbon.
+    all_csv = args.outdir / args.all_csv_name
+    df.to_csv(all_csv, index=False)
+    print(f"Saved all citizen tree entries to: {all_csv}")
+
+    carbon_df = df.loc[df["HAS_CARBON_ESTIMATE"] & df["HAS_COORDINATES"]].copy()
+    carbon_df.to_csv(out_csv, index=False)
+    print(f"Saved carbon-estimable entries to: {out_csv}")
 
     build_map(df, out_map)
 
@@ -880,7 +982,7 @@ def main():
     preview_cols = [c for c in preview_cols if c in df.columns]
 
     print("\nPreview:")
-    print(df[preview_cols].head(10).to_string(index=False))
+    print(carbon_df[preview_cols].head(10).to_string(index=False))
 
 
 if __name__ == "__main__":
