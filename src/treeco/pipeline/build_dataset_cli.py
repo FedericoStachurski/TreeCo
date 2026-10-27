@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--dino_score_min", default=0.2, type=float)
 
     ap.add_argument("--depth_ckpt", default=None)
+    ap.add_argument("--no_clip",action="store_true", help = "Disable CLIP filtering")
 
     args = ap.parse_args()
 
@@ -51,6 +52,7 @@ def main():
         dino_text_threshold=args.dino_text_threshold,
         dino_score_min=args.dino_score_min,
         depth_ckpt=depth_ckpt,
+        use_clip=args.no_clip
     )
 
 

@@ -236,6 +236,42 @@ def extract_numeric(x):
     return float(m.group()) if m else np.nan
 
 
+def score_image_with_custom_clip_prompts(
+    image,
+    model,
+    processor,
+    device,
+    positive_prompts: list[str],
+    negative_prompts: list[str],
+    threshold: float,
+) -> dict:
+    """Compare image against positive/negative text prompts using CLIP.
+
+    This is a RELATIVE matching score, not a calibrated probability.
+    Averaging log-scores within each group avoids favouring whichever
+    group has more text prompts.
+    """
+    import math
+    import torch
+
+    prompts = positive_prompts + negative_prompts
+    inputs = processor(text=prompts, images=image, return_tensors="pt", padding=True)
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+
+    with torch.no_grad():
+        logits = model(**inputs).logits_per_image[0].float()
+        n_pos = len(positive_prompts)
+        positive_logit = torch.logsumexp(logits[:n_pos], dim=0) - math.log(n_pos)
+        negative_logit = torch.logsumexp(logits[n_pos:], dim=0) - math.log(len(negative_prompts))
+        score = torch.sigmoid(positive_logit - negative_logit).item()
+
+    return {
+        "tree_score": float(score),
+        "top_prompt": prompts[int(torch.argmax(logits).item())],
+        "is_tree": score >= threshold,
+    }
+
+
 def make_image_uuid(id_val, media_src: str) -> str:
     """Stable image identifier across rebuilds, based on original ID + URL."""
     s = f"{clean_id(id_val)}::{str(media_src).strip()}"
@@ -718,11 +754,35 @@ def build_tree_dataset(
     sam3_repo_path: str | Path | None = None,
     sam3_prompt: str = "tree",
     sam3_min_score: float | None = None,
+    use_clip: bool = True,
+    clip_prompts: list[str] | None = None,
+    clip_negative_prompts: list[str] | None = None,
 ) -> Path:
     input_path = Path(input_path)
     out_root = Path(out_root)
 
-    if clip_model_path is None:
+    if not 0.0 <= clip_threshold <= 1.0:
+        raise ValueError("clip_threshold must be between 0 and 1")
+
+    # Without custom prompts, preserve the existing CLIP scoring behaviour.
+    if use_clip and clip_prompts is not None:
+        clip_prompts = [str(x).strip() for x in clip_prompts if str(x).strip()]
+        if not clip_prompts:
+            raise ValueError("clip_prompts must contain at least one nonempty phrase")
+        if clip_negative_prompts is None:
+            clip_negative_prompts = [
+                "a drawing or illustration of leaves or a tree",
+                "a photograph of grass without a tree",
+                "a photograph of a street without a tree",
+                "a photograph of a person without a tree",
+            ]
+        clip_negative_prompts = [str(x).strip() for x in clip_negative_prompts if str(x).strip()]
+        if not clip_negative_prompts:
+            raise ValueError("clip_negative_prompts must contain at least one nonempty phrase")
+    elif use_clip and clip_negative_prompts is not None:
+        raise ValueError("Supply clip_prompts as well as clip_negative_prompts")
+
+    if use_clip and clip_model_path is None:
         clip_model_path = get_model_path("clip")
     if dino_model_path is None:
         dino_model_path = get_model_path("grounding_dino")
@@ -735,7 +795,8 @@ def build_tree_dataset(
     if keep_sam3 and sam3_repo_path is None:
         sam3_repo_path = get_model_path("sam3_repo")
 
-    assert_model_exists(clip_model_path, "CLIP")
+    if use_clip:
+        assert_model_exists(clip_model_path, "CLIP")
     assert_model_exists(dino_model_path, "GroundingDINO")
     if keep_depth:
         assert_model_exists(depth_ckpt, "Depth Anything")
@@ -776,7 +837,13 @@ def build_tree_dataset(
         f"keep_sam3={keep_sam3}, "
         f"keep_depth={keep_depth}"
     )
-    print(f"CLIP model: {clip_model_path}")
+    print(f"CLIP enabled: {use_clip}")
+    if use_clip:
+        print(f"CLIP model: {clip_model_path}")
+        print(f"CLIP threshold: {clip_threshold}")
+        print(f"Custom positive prompts: {clip_prompts}")
+        if clip_prompts is not None:
+            print(f"Custom negative prompts: {clip_negative_prompts}")
     print(f"DINO model: {dino_model_path}")
     if keep_sam:
         print(f"SAM checkpoint: {sam_ckpt}")
@@ -814,9 +881,11 @@ def build_tree_dataset(
     n_exploded_image_rows = len(df_img)
     n_exploded_unique_ids = int(df_img["ID"].nunique()) if "ID" in df_img.columns else 0
 
-    clip_model, clip_processor, clip_device = CLIP_filtering_system.load_clip_model(
-        model_path=str(clip_model_path)
-    )
+    clip_model = clip_processor = clip_device = None
+    if use_clip:
+        clip_model, clip_processor, clip_device = CLIP_filtering_system.load_clip_model(
+            model_path=str(clip_model_path)
+        )
 
     dino_processor, dino_model, dino_device = groundingdino_box_cropping.load_grounding_dino(
         model_path=str(dino_model_path)
@@ -933,18 +1002,38 @@ def build_tree_dataset(
             append_failed("LOAD_ERROR")
             continue
 
-        try:
-            clip_res = CLIP_filtering_system.score_images_batch(
-                image_paths=[img],
-                model=clip_model,
-                processor=clip_processor,
-                device=clip_device,
-                batch_size=1,
-                threshold=clip_threshold,
-            )[0]
-        except Exception:
-            append_failed("CLIP_ERROR")
-            continue
+        if not use_clip:
+            clip_res = {
+                "tree_score": None,
+                "top_prompt": "CLIP_SKIPPED",
+                "is_tree": True,
+            }
+        else:
+            try:
+                if clip_prompts is None:
+                    # Exact original behaviour when no custom prompts are supplied.
+                    clip_res = CLIP_filtering_system.score_images_batch(
+                        image_paths=[img],
+                        model=clip_model,
+                        processor=clip_processor,
+                        device=clip_device,
+                        batch_size=1,
+                        threshold=clip_threshold,
+                    )[0]
+                else:
+                    clip_res = score_image_with_custom_clip_prompts(
+                        image=img,
+                        model=clip_model,
+                        processor=clip_processor,
+                        device=clip_device,
+                        positive_prompts=clip_prompts,
+                        negative_prompts=clip_negative_prompts,
+                        threshold=clip_threshold,
+                    )
+            except Exception as exc:
+                print(f"CLIP failed for {row.get('IMAGE_ID')}: {exc}")
+                append_failed("CLIP_ERROR")
+                continue
 
         tree_score = clip_res.get("tree_score")
         top_prompt = clip_res.get("top_prompt")
@@ -1292,6 +1381,13 @@ def build_tree_dataset(
         "keep_sam3": keep_sam3,
         "keep_depth": keep_depth,
         "clip_threshold": clip_threshold,
+        "use_clip": use_clip,
+        "clip_prompts": clip_prompts if use_clip else None,
+        "clip_negative_prompts": clip_negative_prompts if use_clip else None,
+        "clip_scoring_mode": (
+            "disabled" if not use_clip else
+            "legacy" if clip_prompts is None else "custom_prompt_comparison"
+        ),
         "dino_threshold": dino_threshold,
         "dino_text_threshold": dino_text_threshold,
         "dino_score_min": dino_score_min,
