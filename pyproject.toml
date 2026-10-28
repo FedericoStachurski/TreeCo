@@ -40,11 +40,14 @@ treeco-train-width-species = "treeco.training.training_width_with_species_cli:ma
 treeco-train-width-classification = "treeco.training.training_width_classification_cli:main"
 treeco-plot-training = "treeco.training.plot_training_run_cli:main"
 treeco-plot-training-aggregate = "treeco.training.plot_training_aggregate_run_v1_cli:main"
+
 treeco-infer-heights = "treeco.inference.infer_heights_cli:main"
 treeco-infer-widths = "treeco.inference.infer_widths_cli:main"
 treeco-infer-widths-species = "treeco.inference.infer_widths_species_cli:main"
+
 treeco-combine-height-width = "treeco.utils.combine_height_width_cli:main"
 treeco-make-map = "treeco.mapping.make_map_cli:main"
+treeco-make-map-SAM-Depth = "treeco.mapping.make_map_SAM_Depth_final_cli:main"
 treeco-rawdata-make-map = "treeco.mapping.raw_data_make_map_cli:main" 
 treeco-merge-map = "treeco.mapping.treeco_merge_citizen_and_ai_map_cli:main" 
 
