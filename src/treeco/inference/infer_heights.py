@@ -920,7 +920,9 @@ def aggregate_tree_predictions(pred_df: pd.DataFrame, class_names: list[str], co
 
 def infer_missing_heights(
     raw_data_path: Path, dataset_dir: Path, run_path: Path,
-    batch_size: int = 16, num_workers: int = 4, conf_threshold: float | None = None,
+    batch_size: int = 16, num_workers: int = 4,
+    conf_threshold: float | None = None,
+    width_manifest: Path | None = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     raw_data_path, dataset_dir, run_path = Path(raw_data_path), Path(dataset_dir), Path(run_path)
@@ -938,7 +940,14 @@ def infer_missing_heights(
     model, config, species_to_idx, _ = load_model_run(run_path, device)
     manifest_dir = dataset_dir / "manifests"
     manifest_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = resolve_manifest_path(dataset_dir, config)
+    manifest_path = (
+        Path(width_manifest).expanduser()
+        if width_manifest is not None
+        else resolve_manifest_path(dataset_dir, config)
+    )
+
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
     print(f"\nUsing manifest: {manifest_path}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1167,11 +1176,12 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--conf_threshold", type=float, default=None, help="Optional minimum probability for accepting image/tree predictions.")
+    parser.add_argument("--width_manifest",type=Path, default=None, help="Explicit manifest containing the DBH predictions to use.",)
     args = parser.parse_args()
 
     infer_missing_heights(
         raw_data_path=Path(args.raw_data_path), dataset_dir=Path(args.dataset_dir), run_path=Path(args.run_path),
-        batch_size=args.batch_size, num_workers=args.num_workers, conf_threshold=args.conf_threshold,
+        batch_size=args.batch_size, num_workers=args.num_workers, conf_threshold=args.conf_threshold, width_manifest=args.width_manifest,
     )
 
 
