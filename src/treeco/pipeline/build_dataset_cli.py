@@ -52,7 +52,7 @@ def main():
         dino_text_threshold=args.dino_text_threshold,
         dino_score_min=args.dino_score_min,
         depth_ckpt=depth_ckpt,
-        use_clip=args.no_clip
+        use_clip=not args.no_clip
     )
 
 
