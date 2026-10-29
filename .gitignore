@@ -44,6 +44,7 @@ figures/
 *.pth
 *.ckpt
 *.onnx
+*.sbatch
 
 # Raster / imagery
 *.tif
