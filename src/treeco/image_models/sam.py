@@ -356,16 +356,25 @@ def infer_sam3_tree_candidates(
     image = image.convert("RGB")
 
     use_cuda_amp = (
-    device is not None
-    and str(device).startswith("cuda")
-    and torch.cuda.is_available()
+        device is not None
+        and str(device).startswith("cuda")
+        and torch.cuda.is_available()
     )
 
-    amp_context = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if use_cuda_amp
-        else nullcontext()
-    )
+    if use_cuda_amp:
+        # Check GPU architecture
+        major, minor = torch.cuda.get_device_capability(device)
+
+        # V100 (Volta, sm_70) uses FP16
+        # Newer GPUs (Ampere and later) can use BF16
+        amp_dtype = torch.bfloat16 if major >= 8 else torch.float16
+
+        amp_context = torch.autocast(
+            device_type="cuda",
+            dtype=amp_dtype
+        )
+    else:
+        amp_context = nullcontext()
 
     with amp_context:
         inference_state = processor.set_image(image)
