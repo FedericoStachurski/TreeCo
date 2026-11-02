@@ -1982,7 +1982,7 @@ def main():
         "random_state",
         "w_dbh",
         "w_tree_balance",
-        "dbh_weight_bins",
+        "dbh_bin_size",
         "dbh_weight_power",
         "dbh_weight_max",
         "final_weight_max",
